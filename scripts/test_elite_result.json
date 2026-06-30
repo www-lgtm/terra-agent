@@ -1,0 +1,45 @@
+{
+  "screen": "1920x1080",
+  "landscape": true,
+  "operators_on_screen": 7,
+  "operators_matched": 7,
+  "elapsed_ms": 4719.0,
+  "results": [
+    {
+      "name": "电弧",
+      "elite": "E0"
+    },
+    {
+      "name": "妮芙",
+      "elite": "E0"
+    },
+    {
+      "name": "阿米娅",
+      "elite": "E0"
+    },
+    {
+      "name": "流明",
+      "elite": "E0"
+    },
+    {
+      "name": "古米",
+      "elite": "E0"
+    },
+    {
+      "name": "阿消",
+      "elite": "E0"
+    },
+    {
+      "name": "伊内丝",
+      "elite": "E0"
+    }
+  ],
+  "templates_loaded": [
+    "任务点数",
+    "制造站收取提醒",
+    "基建消息",
+    "精一",
+    "精二",
+    "获得任务点数"
+  ]
+}

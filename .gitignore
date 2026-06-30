@@ -1,0 +1,45 @@
+# Environment secrets — do not commit!
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# Runtime data (logs, screenshots, DBs, recordings, learned memories)
+data/emulators/
+data/logs/
+data/screenshots/
+data/debug_screenshots/
+data/memory/
+data/observations/
+data/memories/
+data/run/
+*.db
+*.db-shm
+*.db-wal
+
+# Claude Code project config
+.claude/
+MEMORY.md
+
+# Internal dev docs (plans, notes, drafts)
+docs/
+
+# Root-level temp/debug media and one-off scripts
+/*.png
+/*.jpg
+/extract_operator_skills.py
+
+# OS
+Thumbs.db
+.DS_Store

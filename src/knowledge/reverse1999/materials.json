@@ -1,0 +1,76 @@
+[
+  {
+    "name": "啮咬盒",
+    "stages": [
+      {"code": "7-26厄险", "apCost": 18},
+      {"code": "5-19厄险", "apCost": 18},
+      {"code": "4-10厄险", "apCost": 18}
+    ]
+  },
+  {
+    "name": "双头形骨架",
+    "stages": [
+      {"code": "7-7厄险", "apCost": 18},
+      {"code": "11-20厄险", "apCost": 18}
+    ]
+  },
+  {
+    "name": "百灵百验鸟",
+    "stages": [
+      {"code": "10-6厄险", "apCost": 18}
+    ]
+  },
+  {
+    "name": "红漆泥板",
+    "stages": [
+      {"code": "9-1厄险", "apCost": 18}
+    ]
+  },
+  {
+    "name": "弯曲鹅颈",
+    "stages": [
+      {"code": "5-4厄险", "apCost": 18}
+    ]
+  },
+  {
+    "name": "砂金甲虫",
+    "stages": [
+      {"code": "3-15故事", "apCost": 18}
+    ]
+  },
+  {
+    "name": "盐封曼德拉",
+    "stages": [
+      {"code": "3-13厄险", "apCost": 18},
+      {"code": "9-16厄险", "apCost": 18},
+      {"code": "8-17厄险", "apCost": 18}
+    ]
+  },
+  {
+    "name": "祝圣秘银",
+    "stages": [
+      {"code": "12-5厄险", "apCost": 18},
+      {"code": "13-7厄险", "apCost": 18}
+    ]
+  },
+  {
+    "name": "翼造门匙",
+    "stages": [
+      {"code": "12-18厄险", "apCost": 18},
+      {"code": "5-3厄险", "apCost": 18},
+      {"code": "9-15厄险", "apCost": 18}
+    ]
+  },
+  {
+    "name": "金草焚香",
+    "stages": [
+      {"code": "4-4故事", "apCost": 18}
+    ]
+  },
+  {
+    "name": "金爪灵摆",
+    "stages": [
+      {"code": "13-10厄险", "apCost": 18}
+    ]
+  }
+]

@@ -1,0 +1,33 @@
+[project]
+name = "terra-agent"
+version = "0.1.0"
+description = "Game assistant agent based on Hermes Agent architecture for Arknights"
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=1.0.0",
+    "anthropic>=0.40.0",
+    "python-dotenv>=1.0.0",
+    "httpx>=0.27.0",
+    "rich>=13.0.0",
+    "pyyaml>=6.0",
+    "pydantic>=2.0.0",
+    "aiohttp>=3.9.0",
+    "Pillow>=10.0.0",
+    "opencv-python>=4.8.0",
+    "numpy>=1.24.0",
+    "croniter>=2.0.0",
+]
+
+[project.optional-dependencies]
+ocr = ["paddleocr>=2.7.0", "paddlepaddle>=2.6.0"]
+adb = ["pure-python-adb>=0.3.0"]
+
+[project.scripts]
+terra-agent = "src.cli:main"
+
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = { find = { where = ["."], include = ["config*", "src*"] } }

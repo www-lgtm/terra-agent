@@ -1,0 +1,238 @@
+{
+  "description": "材料数据库。包含配方、推荐刷取关卡、掉落率。基于PRTS Wiki数据。",
+  "materials": {
+    "固源岩": {
+      "tier": 1,
+      "description": "基础建材，1-7 高效掉落",
+      "drop_stages": [
+        {
+          "code": "1-7",
+          "ap": 6,
+          "drop_rate": 1.2,
+          "note": "单件理智效率最高"
+        },
+        {
+          "code": "S2-12",
+          "ap": 15,
+          "drop_rate": 0.85,
+          "note": "副产物更优"
+        }
+      ],
+      "craft_from": null,
+      "item_ids": [
+        "30012",
+        "30013"
+      ]
+    },
+    "固源岩组": {
+      "tier": 2,
+      "description": "中级建材",
+      "drop_stages": [
+        {
+          "code": "2-4",
+          "ap": 12,
+          "drop_rate": 0.58
+        },
+        {
+          "code": "4-6",
+          "ap": 18,
+          "drop_rate": 0.62
+        },
+        {
+          "code": "S3-4",
+          "ap": 18,
+          "drop_rate": 0.72,
+          "note": "推荐"
+        }
+      ],
+      "craft_from": {
+        "material": "固源岩",
+        "count": 5,
+        "lmd_cost": 200
+      }
+    },
+    "提纯源岩": {
+      "tier": 3,
+      "description": "高级建材",
+      "drop_stages": [
+        {
+          "code": "4-6",
+          "ap": 18,
+          "drop_rate": 0.08
+        }
+      ],
+      "craft_from": {
+        "material": "固源岩组",
+        "count": 4,
+        "lmd_cost": 400
+      }
+    },
+    "装置": {
+      "tier": 1,
+      "description": "基础电子元件",
+      "drop_stages": [
+        {
+          "code": "S3-4",
+          "ap": 18,
+          "drop_rate": 0.48
+        }
+      ],
+      "craft_from": null,
+      "item_ids": [
+        "30061",
+        "30062",
+        "30063",
+        "30064"
+      ]
+    },
+    "全新装置": {
+      "tier": 2,
+      "description": "中级电子元件",
+      "drop_stages": [
+        {
+          "code": "3-4",
+          "ap": 15,
+          "drop_rate": 0.22
+        }
+      ],
+      "craft_from": {
+        "material": "装置",
+        "count": 4,
+        "lmd_cost": 300
+      }
+    },
+    "异铁": {
+      "tier": 1,
+      "description": "基础金属材料",
+      "drop_stages": [
+        {
+          "code": "S4-1",
+          "ap": 21,
+          "drop_rate": 0.45
+        }
+      ],
+      "craft_from": null,
+      "item_ids": [
+        "30041",
+        "30042",
+        "30043",
+        "30044"
+      ]
+    },
+    "异铁组": {
+      "tier": 2,
+      "description": "中级金属材料",
+      "drop_stages": [
+        {
+          "code": "S4-1",
+          "ap": 21,
+          "drop_rate": 0.24
+        }
+      ],
+      "craft_from": {
+        "material": "异铁",
+        "count": 4,
+        "lmd_cost": 300
+      }
+    },
+    "糖": {
+      "tier": 1,
+      "description": "基础糖类",
+      "drop_stages": [
+        {
+          "code": "GT-6",
+          "ap": 15,
+          "drop_rate": 0.52
+        }
+      ],
+      "craft_from": null,
+      "item_ids": [
+        "30021",
+        "30022",
+        "30023",
+        "30024",
+        "act33side_token_sugar"
+      ]
+    },
+    "糖组": {
+      "tier": 2,
+      "description": "中级糖类",
+      "drop_stages": [
+        {
+          "code": "2-5",
+          "ap": 12,
+          "drop_rate": 0.36
+        }
+      ],
+      "craft_from": {
+        "material": "糖",
+        "count": 4,
+        "lmd_cost": 300
+      }
+    },
+    "糖聚块": {
+      "tier": 3,
+      "description": "高级糖类",
+      "drop_stages": [],
+      "craft_from": {
+        "material": "糖组",
+        "count": 4,
+        "lmd_cost": 500
+      }
+    },
+    "扭转醇": {
+      "tier": 2,
+      "description": "中级化工材料",
+      "drop_stages": [
+        {
+          "code": "4-4",
+          "ap": 18,
+          "drop_rate": 0.46
+        }
+      ],
+      "craft_from": null,
+      "item_ids": [
+        "30073"
+      ]
+    },
+    "龙门币": {
+      "tier": 0,
+      "description": "游戏通用货币",
+      "drop_stages": [
+        {
+          "code": "CE-5",
+          "ap": 30,
+          "drop_rate": 7500,
+          "note": "龙门币本（固定掉落）"
+        },
+        {
+          "code": "CE-6",
+          "ap": 36,
+          "drop_rate": 10000,
+          "note": "龙门币本（固定掉落）"
+        }
+      ],
+      "craft_from": null
+    }
+  },
+  "item_id_to_name": {
+    "30012": "固源岩",
+    "30013": "固源岩组",
+    "30014": "提纯源岩",
+    "30021": "代糖",
+    "30022": "糖",
+    "30023": "糖组",
+    "30024": "糖聚块",
+    "30041": "异铁碎片",
+    "30042": "异铁",
+    "30043": "异铁组",
+    "30044": "异铁块",
+    "30061": "破损装置",
+    "30062": "装置",
+    "30063": "全新装置",
+    "30064": "改量装置",
+    "30073": "扭转醇",
+    "4001": "龙门币",
+    "act33side_token_sugar": "粗制糖块"
+  }
+}
