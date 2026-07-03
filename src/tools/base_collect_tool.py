@@ -209,7 +209,22 @@ def base_collect() -> ToolOutput:
         cx, cy = det["center"]
         logger.info("base_collect: clicking tab '%s' at (%d, %d)", tab_name, cx, cy)
         adb.tap(cx, cy)
-        time.sleep(_TAB_CLICK_DELAY)
+
+        # Wait for the tab text to actually disappear before moving on.
+        # Fixed sleep isn't reliable — tab animations vary in duration.
+        # Poll OCR until this tab's text is gone (max 3s).
+        wait_deadline = time.monotonic() + 3.0
+        while time.monotonic() < wait_deadline:
+            time.sleep(0.3)
+            dets_after = ocr_engine.read_text(adb.get_screenshot_image())
+            gone = not any(
+                (tab_name in d["text"] or d["text"] in tab_name)
+                for d in dets_after
+                if d["center"][1] >= panel_y_min and len(d["text"]) <= 20
+            )
+            if gone:
+                break
+
         clicked.append(tab_name)
 
     if not clicked:
