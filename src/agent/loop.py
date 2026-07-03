@@ -1878,9 +1878,18 @@ class TerraAgent:
                             if target and len(target) >= 2 and any(target in ot for ot in _ocr_now):
                                 _targets_on_screen = True
                                 break
-                        # P0: adb_back is always a safe retreat — never block.
+                        # adb_back is NOT safe during loading screens —
+                        # it cancels the navigation and sends you backwards.
+                        # Only exempt if the screen has substantial OCR content.
                         _only_back = all(tc == "adb_back" for tc in _conflict_tools)
-                        if _only_back and not _targets_on_screen:
+                        _loading_screen = (
+                            len(self.state.last_ocr_texts or []) < 8
+                            and any(
+                                kw in " ".join(self.state.last_ocr_texts or []).lower()
+                                for kw in _LOADING_SCREEN_KW
+                            )
+                        )
+                        if _only_back and not _targets_on_screen and not _loading_screen:
                             self._wait_intent_conflict_streak = 0
                             logger.debug(
                                 "Wait-intent bypass: adb_back retreat allowed (iter %d)",
