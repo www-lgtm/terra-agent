@@ -176,19 +176,18 @@ def base_collect() -> ToolOutput:
                panel_y_min, len(_panel_texts),
                ", ".join(_panel_texts) if _panel_texts else "(none)")
 
-    # ── Step 5: Click each tab — no verification, just fire and move on
-    # Re-OCR every iteration for fresh coordinates (tabs shift after
-    # collection).  User verifies via the final screenshot.
+    # ── Step 5: Keep clicking the first visible tab until none remain
+    # Don't dedup by name — the same tab (e.g. 可收获) can reappear if
+    # a new product finishes mid-collection.  The "wait for disappear"
+    # poll below prevents looping on the same tab instance.
     clicked: list[str] = []
-    max_clicks = len(_COLLECT_TABS)
+    max_clicks = len(_COLLECT_TABS) + 3  # allow for re-appearing tabs
 
     for _ in range(max_clicks):
         dets = ocr_engine.read_text(adb.get_screenshot_image())
 
         first_tab: tuple[str, dict] | None = None
         for tab_name in _COLLECT_TABS:
-            if tab_name in clicked:
-                continue
             for d in dets:
                 cy = d["center"][1]
                 if cy < panel_y_min:
