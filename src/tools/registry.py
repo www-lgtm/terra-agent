@@ -174,7 +174,7 @@ class ToolRegistry:
         _CONDITIONAL: list[tuple[list[str], list[str]]] = [
             (["base"],        ["base_shift_maa"]),
             (["recruit"],     ["optimize_recruit_tags"]),
-            (["box", "warehouse", "depot"], ["scan_operator_box", "scan_depot", "save_depot_resources"]),
+            (["box", "warehouse", "depot", "base"], ["scan_operator_box", "scan_depot", "save_depot_resources"]),
             (["material"],    ["vlm_match_material", "vlm_identify_icon"]),
             (["schedule", "cron"], ["schedule_create", "schedule_list", "schedule_delete", "schedule_toggle"]),
         ]

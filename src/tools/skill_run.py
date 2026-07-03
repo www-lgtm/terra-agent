@@ -44,6 +44,26 @@ def skill_run(name: str) -> ToolOutput:
 
     has_coords = any(s.get("coords") for s in steps)
     if not has_coords:
+        # ── Auto-redirect to dedicated tool if one exists ──────────────
+        # Many sub-skills now have dedicated deterministic tools
+        # (e.g. base-collect → base_collect).  When skill_run() is
+        # called for such a skill, redirect to the tool automatically
+        # instead of returning the skill text for manual execution.
+        # This is a safety net — the LLM should call the tool directly,
+        # but if it calls skill_run instead, it still works.
+        tool_name = name.replace("-", "_")
+        tool_entry = registry.get(tool_name)
+        if tool_entry is not None:
+            logger.info("skill_run: '%s' → auto-redirecting to %s()", name, tool_name)
+            try:
+                result = tool_entry.handler()
+                if isinstance(result, ToolOutput):
+                    return result
+                return ToolOutput(text=result)
+            except Exception as e:
+                logger.warning("skill_run: '%s' → %s() redirect failed: %s", name, tool_name, e)
+                # Fall through to manual execution below
+
         # Re-inject full Steps + Pitfalls so the LLM has the instructions
         # right in front of it instead of relying on stale system prompt memory.
         pitfalls = skill.get("pitfalls", [])

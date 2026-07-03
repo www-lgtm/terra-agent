@@ -6,6 +6,7 @@ Import this module to register all built-in tools with the registry.
 # Import tool modules to trigger self-registration
 from src.tools import adb_control  # noqa: F401
 from src.tools import ask_user  # noqa: F401
+from src.tools import base_collect_tool  # noqa: F401
 from src.tools import base_shift_tool  # noqa: F401
 from src.tools import box_scan_tool  # noqa: F401
 from src.tools import confidence  # noqa: F401

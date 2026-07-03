@@ -314,6 +314,8 @@ class TerraAgent:
         self._repeat_think_streak: int = 0            # Consecutive near-identical thinking rounds
         self._subtask_iter: dict[str, int] = {}       # Per-subtask iteration counter
         self._subtask_iter_warned: set[str] = set()   # Subtasks that already got the 40-iter warning
+        self._last_skill_run: str = ""                # Most recent skill_run name (for subtask tracking)
+        self._verify_step: str = ""                 # Orchestrator verify step name (e.g. "daily-reward-check")
         self._last_memory_hint = ""
         self._last_user_hint = ""
         self._last_review_skill_hash: str | None = None  # Dedup review injections
@@ -439,14 +441,41 @@ class TerraAgent:
             set_current_game(detected)
             self.tool_ctx.game = detected  # Keep ToolContext in sync after game switch
         self.state.matching_skills = routing["matching_skills"]
-        if routing["matching_skills"]:
-            skill_names = [s["name"] for s in routing["matching_skills"]]
+        # ── Filter orphan skills when an orchestrator is matched ──
+        # FTS5 may return skills (e.g. base-shift) that are NOT in the
+        # orchestrator's subskills list.  These orphan skills cause the
+        # subtask iteration tracker to track the wrong name and emit
+        # confusing timeout warnings.  Keep only: the orchestrator itself
+        # + skills listed in its subskills.
+        # NOTE: routing results don't carry the full frontmatter — we
+        # must load the orchestrator from the skill manager to get subskills.
+        _orchs = [s for s in self.state.matching_skills if s.get("type") == "orchestrator"]
+        if _orchs:
+            _orch = _orchs[0]
+            _orch_name = _orch["name"]
+            try:
+                from src.skills.manager import get_skill_manager
+                _skm = get_skill_manager(_orch.get("game", "arknights"))
+                _full_orch = _skm.load(_orch_name)
+                _valid_names = set(_full_orch.get("subskills", []) if _full_orch else [])
+            except Exception:
+                _valid_names = set()
+            _valid_names.add(_orch_name)
+            _filtered = [s for s in self.state.matching_skills if s["name"] in _valid_names]
+            if len(_filtered) < len(self.state.matching_skills):
+                _dropped = [s["name"] for s in self.state.matching_skills if s not in _filtered]
+                logger.info("Filtered %d orphan skills (not in orchestrator subskills): %s",
+                           len(_dropped), _dropped)
+                self.state.matching_skills = _filtered
+
+        if self.state.matching_skills:
+            skill_names = [s["name"] for s in self.state.matching_skills]
             logger.info("Matched skills: %s", skill_names)
 
         # Adjust iteration budget based on task complexity.
         # Simple per-skill budget — daily tasks use matched skill count.
         # 50 iter/skill is ample (6/25 run: 5 skills completed in 173 iters).
-        self.budget.adjust_for_skills(max(len(routing["matching_skills"]), 1))
+        self.budget.adjust_for_skills(max(len(self.state.matching_skills), 1))
 
         # ── Runtime context injection ──
         # When an orchestrator skill is matched, inject day-of-week, game state,
@@ -1264,10 +1293,17 @@ class TerraAgent:
             _completed = self.state.completed_subtasks or set()
             _skills = self.state.matching_skills or []
             _current_skill = ""
-            for _s in (_skills or []):
-                if _s["name"] not in _completed and _s.get("type") != "orchestrator":
-                    _current_skill = _s["name"]
-                    break
+            # Prefer the most recently skill_run'd subtask — the agent may
+            # reorder subtasks, and the first uncompleted skill in the list
+            # is not necessarily what the agent is working on right now.
+            _sk_names = {_s["name"] for _s in (_skills or []) if _s.get("type") != "orchestrator"}
+            if self._last_skill_run and self._last_skill_run in _sk_names and self._last_skill_run not in _completed:
+                _current_skill = self._last_skill_run
+            else:
+                for _s in (_skills or []):
+                    if _s["name"] not in _completed and _s.get("type") != "orchestrator":
+                        _current_skill = _s["name"]
+                        break
             if _current_skill:
                 _sk_iter = self._subtask_iter.get(_current_skill, 0) + 1
                 self._subtask_iter[_current_skill] = _sk_iter
@@ -1853,7 +1889,19 @@ class TerraAgent:
                             # Fall through — don't discard
                         elif not _targets_on_screen:
                             self._wait_intent_conflict_streak += 1
-                            if self._wait_intent_conflict_streak >= 3:
+                            # On the first conflict, if the screen has meaningful
+                            # content (≥8 OCR texts), the screen IS loaded — the
+                            # LLM is just being cautious.  Execute immediately
+                            # instead of wasting a round-trip.
+                            _ocr_count = len(self.state.last_ocr_texts or [])
+                            if self._wait_intent_conflict_streak == 1 and _ocr_count >= 8:
+                                self._wait_intent_conflict_streak = 0
+                                logger.debug(
+                                    "Wait-intent bypassed: screen has %d OCR texts (iter %d)",
+                                    _ocr_count, self.state.iteration_count,
+                                )
+                                # Fall through — execute tools
+                            elif self._wait_intent_conflict_streak >= 3:
                                 # Before executing anyway, check if the screen is
                                 # genuinely still loading.  If OCR contains loading
                                 # keywords (RHODES ISLAND, INFRASTRUCTURE, etc.),
@@ -2183,16 +2231,13 @@ class TerraAgent:
                     else:
                         output = registry.dispatch(tool_name, ctx=self.tool_ctx, **tool_input)
                 elif tool_name == "task_complete":
-                    # ── Premature task_complete guard ──
-                    # Multi-skill threshold: 20 iterations (first review fires
-                    # at iter 16, needed context is loaded).
-                    # Single-skill threshold: 8 iterations — even solo tasks
-                    # need time to navigate + execute + verify.
-                    # P2: added single-skill guard (was unprotected — a solo
-                    # skill could call task_complete at iter 2 with no block).
+                    # ── Premature task_complete guards ──
+                    # Guard 1: iteration count — too early to be done?
+                    # Multi-skill threshold: 20 iterations. Single-skill: 8.
                     skills = self.state.matching_skills
                     _completed = self.state.completed_subtasks or set()
                     _min_iters = 20 if len(skills) > 1 else 8
+                    _blocked = False
                     if self.state.iteration_count < _min_iters:
                         _all_done = _completed and len(skills) > 1 and all(
                             s["name"] in _completed for s in skills
@@ -2218,20 +2263,45 @@ class TerraAgent:
                                     f"[系统提示] 才跑了 {self.state.iteration_count} 轮，"
                                     "任务不太可能已经完成。需要继续执行。"
                                     "确认任务目标达成后再调 task_complete。")
-                            output = ToolOutput(
-                                text=json.dumps({
-                                    "blocked": True,
-                                    "message": "请继续执行任务，确认完成后再调 task_complete。",
-                                }),
-                            )
-                        else:
-                            output = registry.dispatch(tool_name, ctx=self.tool_ctx, **tool_input)
+                            _blocked = True
+
+                    # Guard 2: orchestrator verify step not completed?
+                    # This fires even at high iteration counts — the orchestrator
+                    # body requires a verification step (e.g. checking daily
+                    # reward panel) before task_complete.  Without this check
+                    # the LLM can "forget" Step 5 after 80+ iterations.
+                    if not _blocked and self._verify_step and self._verify_step not in _completed:
+                        logger.warning(
+                            "task_complete BLOCKED (verify): '%s' not in completed_subtasks=%s",
+                            self._verify_step, sorted(_completed) if _completed else [],
+                        )
+                        self.state.add_message("user",
+                            f"[系统 — 完成前验证] 🔴 所有子任务完成后必须执行验证步骤。\n"
+                            f"请立即执行以下操作：\n"
+                            f"1. 进入日常任务页面确认奖励全部领取完毕\n"
+                            f"2. notify_with_screen 截图通知用户\n"
+                            f"3. 调用 subtask_done('{self._verify_step}', '验证结果')\n"
+                            f"完成后再次调用 task_complete()。")
+                        _blocked = True
+
+                    if _blocked:
+                        output = ToolOutput(
+                            text=json.dumps({
+                                "blocked": True,
+                                "message": "请先完成验证步骤再调 task_complete。",
+                            }),
+                        )
                     else:
                         output = registry.dispatch(tool_name, ctx=self.tool_ctx, **tool_input)
                 else:
                     output = registry.dispatch(tool_name, ctx=self.tool_ctx, **tool_input)
                 elapsed = time.monotonic() - t_tool
                 logger.info("Tool %s done (%.1fs)", tool_name, elapsed)
+                # ── Track active subtask from skill_run calls ──
+                if tool_name == "skill_run":
+                    _sk_name = tool_input.get("name", "")
+                    if _sk_name:
+                        self._last_skill_run = _sk_name
                 # ── Diagnostic: log task_done for task_complete / subtask_done ──
                 if tool_name in ("task_complete", "subtask_done"):
                     logger.info("  -> %s: task_done=%s subtask_done=%s",
@@ -2374,18 +2444,27 @@ class TerraAgent:
                     _raw = f"pct({_x_b:.2f},{_y_b:.2f})"
                 target = _normalize_stuck_target(_raw)
 
-                # Positional tools auto-count (always "succeed" at ADB level).
-                # Track by normalized target ONLY — NOT by screen hash.
-                # Base UI animations cause minor dHash changes (3c985b9d→61985b51)
-                # even when the tap had no effect. Hash-independent tracking
-                # ensures the counter accumulates across animation noise.
+                # Positional tools: adb_tap_position/tap_magnified always report
+                # success=True at the ADB level (the tap was executed).  To tell
+                # whether the tap actually DID something, check screen_changed.
+                # Minor dHash noise (animations, particle effects) is already
+                # filtered by _tap_with_screen_check's dist≥5 threshold, so
+                # screen_changed=True means the screen genuinely transitioned.
                 _is_positional = tool_name in ("adb_tap_position", "tap_magnified")
-                if not _tool_success or _is_positional:
+                _sc = _parsed.get("screen_changed") if _parsed else None
+                # Only count as stuck if: explicit failure, OR positional tap
+                # where screen_changed is definitely False (not None/unknown).
+                _is_stuck = (not _tool_success) or (_is_positional and _sc is False)
+                if _is_stuck:
                     if target == self._stuck_target:
                         self._stuck_count += 1
                     else:
                         self._stuck_target = target
                         self._stuck_count = 1
+                elif _is_positional and _sc is True:
+                    # Positional tap actually changed the screen → reset counter
+                    self._stuck_count = 0
+                    self._stuck_target = ""
 
                 _STAGE1 = 2
                 _STAGE2 = 5
@@ -2509,50 +2588,79 @@ class TerraAgent:
                         }
                     break  # No more tool execution while waiting for user
 
-                # ── Subtask boundary cleanup ──
-                # When the agent calls subtask_done(), clean intermediate
-                # operations for that subtask from conversation history.
-                # This keeps context size manageable without relying on
-                # lossy LLM summarization.  The agent continues from the
-                # clean context into the next subtask.
-                if output.subtask_done:
-                    name = output.subtask_name
-                    result = output.subtask_result
-                    logger.info(
-                        "Subtask complete: '%s' → '%s'. Cleaning conversation history.",
-                        name, result,
-                    )
-                    self.state.clean_subtask_history(name, result)
-                    self.state.completed_subtasks.add(name)
-                    self._subtask_iter.pop(name, None)  # reset iteration counter
-                    self._subtask_iter_warned.discard(name)
-                    self._persist_checkpoint()
+            # ── Check for user intervention (ALL tools, not just action tools) ──
+            # ask_user tool returns needs_user=True, but the check above at line
+            # ~2565 only runs for tools in ACTION_TOOLS — ask_user is NOT one.
+            # This catch-all ensures ask_user's notification reaches the user.
+            if output.needs_user:
+                confirmation = self._needs_confirmation(output)
+                if confirmation:
+                    self.state._ask_user_count += 1
+                    if self.ask_fn:
+                        answer = self.ask_fn(confirmation)
+                        self.state.add_message("user", f"[Guidance] {answer}")
+                    elif self.state.on_notify:
+                        self._notify_with_screen(f"🤔 {confirmation}")
+                        self._wait_cycles = 0
+                        self.state._waiting_for_user = True
+                        immediate = self.state.pop_interrupt()
+                        if immediate:
+                            self.state.add_message("user", f"[用户回复] {immediate}")
+                            self.state._waiting_for_user = False
+                            logger.info("Immediate user reply caught")
+                    else:
+                        return {
+                            "success": False,
+                            "needs_input": True,
+                            "question": confirmation,
+                            "iterations": self.state.iteration_count,
+                        }
+                    break  # No more tool execution while waiting for user
 
-                    # ── P0: All subtasks done → early exit ──
-                    # Avoid burning remaining budget on post-completion wandering.
-                    _ms = self.state.matching_skills or []
-                    _cs = self.state.completed_subtasks or set()
-                    if _ms and _cs:
-                        _all_done = all(
-                            s["name"] in _cs for s in _ms
-                            if s.get("type") != "orchestrator"
+            # ── Subtask boundary cleanup ──
+            # When the agent calls subtask_done(), clean intermediate
+            # operations for that subtask from conversation history.
+            # This keeps context size manageable without relying on
+            # lossy LLM summarization.  The agent continues from the
+            # clean context into the next subtask.
+            if output.subtask_done:
+                name = output.subtask_name
+                result = output.subtask_result
+                logger.info(
+                    "Subtask complete: '%s' → '%s'. Cleaning conversation history.",
+                    name, result,
+                )
+                self.state.clean_subtask_history(name, result)
+                self.state.completed_subtasks.add(name)
+                self._subtask_iter.pop(name, None)  # reset iteration counter
+                self._subtask_iter_warned.discard(name)
+                self._persist_checkpoint()
+
+                # ── P0: All subtasks done → early exit ──
+                # Avoid burning remaining budget on post-completion wandering.
+                _ms = self.state.matching_skills or []
+                _cs = self.state.completed_subtasks or set()
+                if _ms and _cs:
+                    _all_done = all(
+                        s["name"] in _cs for s in _ms
+                        if s.get("type") != "orchestrator"
+                    )
+                    if _all_done:
+                        logger.info(
+                            "All subtasks completed (%d/%d), early exit at iter %d",
+                            len(_cs), len([s for s in _ms if s.get("type") != "orchestrator"]),
+                            self.state.iteration_count,
                         )
-                        if _all_done:
-                            logger.info(
-                                "All subtasks completed (%d/%d), early exit at iter %d",
-                                len(_cs), len([s for s in _ms if s.get("type") != "orchestrator"]),
-                                self.state.iteration_count,
-                            )
-                            # Let the loop exit normally — the next guard will
-                            # break when budget.consume() fails or LLM calls
-                            # task_complete.  We just log for visibility.
-                    # Inject the current screen after cleaning so the agent
-                    # sees a fresh image immediately (otherwise the screen
-                    # injection at line 1792 only fires when
-                    # any_action_succeeded and next iteration starts).
-                    # Force-screen-inject will happen naturally on the next
-                    # iteration — the tail of clean_subtask_history already
-                    # contains the latest screen.
+                        # Let the loop exit normally — the next guard will
+                        # break when budget.consume() fails or LLM calls
+                        # task_complete.  We just log for visibility.
+                # Inject the current screen after cleaning so the agent
+                # sees a fresh image immediately (otherwise the screen
+                # injection at line 1792 only fires when
+                # any_action_succeeded and next iteration starts).
+                # Force-screen-inject will happen naturally on the next
+                # iteration — the tail of clean_subtask_history already
+                # contains the latest screen.
 
             # ── Post-tool-loop termination: if _task_completed was set by
             # the per-tool check above, exit immediately.  Belt-and-suspenders
@@ -2751,6 +2859,7 @@ class TerraAgent:
         orchestrators = [s for s in actionable if s.get("type") == "orchestrator"]
         if orchestrators:
             orch = orchestrators[0]
+            self._verify_step = orch.get("verify", "")
             return _expand_orchestrator_body(orch)
 
         # Prefer script skills, then guide with most body content.
@@ -3018,19 +3127,34 @@ def _expand_orchestrator_body(skill: dict[str, Any]) -> str:
     if subskills:
         game = skill.get("game", "arknights")
         skill_mgr = get_skill_manager(game)
-        # Split verified (skill_run) vs unverified (manual only)
+        # Split: delegated tools (have a registered tool) vs verified (skill_run)
+        # vs unverified (manual only).  A sub-skill whose name maps to a
+        # registered tool (e.g. base-collect → base_collect) is always
+        # delegated — the dedicated tool handles it, no manual steps needed.
+        delegated_subs: list[str] = []
         verified_subs: list[str] = []
         unverified_subs: list[str] = []
         missing_subs: list[str] = []
         for sub_name in subskills:
-            sub = skill_mgr.load(sub_name)
-            if sub and sub.get("verified"):
-                verified_subs.append(sub_name)
-            elif sub:
-                unverified_subs.append(sub_name)
+            # Check for a dedicated tool first (kebab → snake)
+            tool_name = sub_name.replace("-", "_")
+            if registry.get(tool_name):
+                delegated_subs.append(sub_name)
             else:
-                missing_subs.append(sub_name)
+                sub = skill_mgr.load(sub_name)
+                if sub and sub.get("verified"):
+                    verified_subs.append(sub_name)
+                elif sub:
+                    unverified_subs.append(sub_name)
+                else:
+                    missing_subs.append(sub_name)
 
+        if delegated_subs:
+            lines.append("### 委派工具（调用专用工具一键完成，极快且免费）")
+            for sub_name in delegated_subs:
+                lines.append(f"- 🎯 **{sub_name}** — 调用 {sub_name.replace('-', '_')}() 工具")
+            lines.append("> 🔴 每个子技能完成后必须 notify_with_screen 截图，然后 subtask_done。详见执行计划。")
+            lines.append("")
         if verified_subs:
             lines.append("### 已验证子技能（调用 skill_run 一键执行，极快且免费）")
             for sub_name in verified_subs:
@@ -3067,11 +3191,21 @@ def _expand_orchestrator_body(skill: dict[str, Any]) -> str:
                 lines.append(f"- ⚠️ **{sub_name}** — 技能文件未找到，需手动执行")
             lines.append("")
 
+    # ── Verification step (orchestrator-level) ──
+    verify_name = skill.get("verify", "")
+    if verify_name:
+        lines.append("### 🔍 完成前验证（必须执行）")
+        lines.append(f"- [ ] **{verify_name}** — 所有操作子任务完成后，必须执行验证步骤确认结果")
+        lines.append(f"> 🔴 **系统强制**：task_complete 前必须调用 subtask_done('{verify_name}', '验证结果')")
+        lines.append(f"> 不调用 subtask_done('{verify_name}') 直接 task_complete 会被系统拦截。")
+        lines.append(f"> 详见下方执行计划中的验证步骤。")
+        lines.append("")
+
     # ── Execution plan ──
     lines.append("### 执行计划")
     lines.append(body)
     lines.append("")
-    lines.append("> 已验证用 skill_run()，未验证按步骤手动执行。全部完成后 task_complete()。")
+    lines.append("> 已验证用 skill_run()，未验证按步骤手动执行。所有子任务 + 验证步骤完成后 task_complete()。")
 
     return "\n".join(lines)
 
@@ -3207,6 +3341,11 @@ def _format_skill_for_review(skill: dict[str, Any]) -> str:
             if verified_count > 0:
                 lines.append(f"\n> ✅ {verified_count} 个子技能可用 skill_run 一键执行（极快且免费）。"
                             f" 每个子技能完成后必须先 notify_with_screen 截图再 subtask_done。")
+        verify_name = skill.get("verify", "")
+        if verify_name:
+            lines.append(f"\n🔍 **完成前验证（系统强制）**：")
+            lines.append(f"  - [ ] **{verify_name}** — 所有操作子任务完成后，必须执行执行计划中的验证步骤")
+            lines.append(f"  > 🔴 task_complete 前必须调用 subtask_done('{verify_name}')，否则会被系统拦截")
         lines.append(f"\n执行计划：")
         if body:
             lines.append(f"\n{body}")
