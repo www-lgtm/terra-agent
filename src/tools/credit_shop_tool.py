@@ -50,7 +50,7 @@ _ITEM_GRID_Y_BOT = 0.95         # Bottom of item grid
 _OUT_OF_STOCK_MARKERS = ("OUTOFST", "OFSTOCK")
 
 # Confirmation dialog keywords
-_CONFIRM_KW = ("确认", "购买", "确定", "是", "花费", "CONFIRM")
+_CONFIRM_KW = ("确认", "购买物品", "购买", "确定", "是", "花费", "CONFIRM", "BUY")
 _POPUP_KW = ("获得物品", "获得", "GET", "ITEM")
 # Popups that may appear on the credit shop screen (before the shop grid)
 _SHOP_POPUP_KW = ("好友", "剿灭", "得分", "最高", "记录", "FRIEND", "ANNIHILATION")
@@ -200,23 +200,30 @@ def _scan_items(adb, w: int, h: int) -> list[dict]:
             if any(m in band_texts for m in _OUT_OF_STOCK_MARKERS):
                 continue
 
-            # Find price: look for numbers in plausible range (10-600)
-            # Credit shop prices: typically 25-400, but be generous
+            # Find price: look for numbers in plausible range (10-600).
+            # OCR frequently glues the price to adjacent numbers:
+            #   160 → "16040", 200 → "20050" or "200100"
+            # Strategy: try clean numbers first, then extract leading digits.
             price = 0
             for d in band_dets:
                 t = d["text"].strip()
-                # Try various patterns: pure number, discount with slash, etc.
-                for pat in [
-                    r'^(\d{2,4})$',                      # pure number like "100", "360"
-                    r'(\d{2,3})/(\d{2,3})',              # discount like "80/160"
-                ]:
-                    m = re.search(pat, t)
-                    if m:
-                        p = int(m.group(1))
-                        if 10 <= p <= 600:
-                            price = p
-                            break
-                if price:
+                # 1) Clean number: "200", "160"
+                m = re.match(r'^(\d{2,3})$', t)
+                if m and 10 <= int(m.group(1)) <= 600:
+                    price = int(m.group(1))
+                    break
+                # 2) Discount: "80/160"
+                m = re.search(r'(\d{2,3})/(\d{2,3})', t)
+                if m:
+                    p = int(m.group(1))
+                    if 10 <= p <= 600:
+                        price = p
+                        break
+                # 3) OCR-glued: "16040"→160, "20050"→200, "200100"→200
+                #    Take the first 3-digit chunk that's a plausible price
+                m = re.match(r'^(\d{3})(?:\d{2,3})$', t)
+                if m and 10 <= int(m.group(1)) <= 600:
+                    price = int(m.group(1))
                     break
 
             if not price:
@@ -225,26 +232,34 @@ def _scan_items(adb, w: int, h: int) -> list[dict]:
                            col, band_name, band_texts)
                 continue
 
-            # Find name: longest text in this band that isn't a number
+            # Find name: prefer Chinese text. English garbage like
+            # "SUORES"/"PreclicalArts" must NOT beat real Chinese names.
             name = ""
+            name_chinese = ""
             for d in band_dets:
                 t = d["text"].strip()
                 if len(t) < 1:
                     continue
-                # Skip discount badges
+                # Skip discount badges and pure numbers
                 if re.match(r'^[-−]?\d{1,3}%$', t):
                     continue
-                # Skip pure numbers and number/slash combos
                 if re.match(r'^\d{1,4}$', t) or re.match(r'^\d{2,3}/\d{2,3}$', t):
                     continue
+                if re.match(r'^\d{3}\d{2,3}$', t):
+                    continue  # OCR-glued price like "16040"
                 # Skip out-of-stock markers
                 if any(m in t for m in _OUT_OF_STOCK_MARKERS):
                     continue
-                # Skip English-only labels
-                if t.isascii() and len(t) < 3:
-                    continue
-                if len(t) > len(name):
-                    name = t
+                has_cjk = any('一' <= ch <= '鿿' for ch in t)
+                if has_cjk:
+                    if len(t) > len(name_chinese):
+                        name_chinese = t
+                else:
+                    # English/other — only use if no Chinese found at all
+                    if not name_chinese and len(t) > len(name) and len(t) >= 3:
+                        name = t
+
+            name = name_chinese or name
 
             if name and price:
                 # Click target: center of column, average Y of the band
@@ -413,24 +428,35 @@ def credit_shop() -> ToolOutput:
         adb.shell("input", "tap", str(cx), str(cy))
 
         # Wait for confirmation dialog
-        if not _wait_for_text(adb, _CONFIRM_KW, timeout=3.0):
+        if _wait_for_text(adb, _CONFIRM_KW, timeout=3.0):
+            # Tap the confirm button — try OCR first, then fixed position
+            tapped = False
+            for kw in _CONFIRM_KW:
+                if _find_and_tap(adb, kw, w, h):
+                    tapped = True
+                    break
+            if not tapped:
+                # Fallback: tap bottom-right of dialog (~common confirm button area)
+                logger.warning("credit_shop: confirm button not found via OCR, using fixed position")
+                adb.shell("input", "tap", str(int(w * 0.80)), str(int(h * 0.82)))
+            time.sleep(0.3)
+
+            # Wait for reward popup and dismiss
+            _wait_for_text(adb, _POPUP_KW, timeout=3.0)
+            time.sleep(0.3)
+            adb.press_back()
+            time.sleep(0.3)
+        else:
+            # No confirm dialog — maybe purchase failed, or dialog is different
+            logger.warning("credit_shop: no confirm dialog for '%s', checking popup", name)
             if _wait_for_text(adb, _POPUP_KW, timeout=1.0):
                 _wait_for_text_gone(adb, _POPUP_KW, timeout=3.0)
-                adb.press_back()
-                time.sleep(0.3)
-            bought.append(item)
-            continue
-
-        _find_and_tap(adb, "确认", w, h)
-        time.sleep(0.3)
-
-        _wait_for_text(adb, _POPUP_KW, timeout=3.0)
-        time.sleep(0.3)
-        adb.press_back()
-        time.sleep(0.3)
+            adb.press_back()
+            time.sleep(0.3)
 
         bought.append(item)
         logger.info("credit_shop: bought '%s' ✓", name)
+        time.sleep(0.3)
 
     # ── Step 7: Screenshot + notify ──────────────────────────────────
     summary = ", ".join(f"{i['name']}({i['price']})" for i in bought)
