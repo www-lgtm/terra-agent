@@ -24,6 +24,9 @@ data/memory/
 data/observations/
 data/memories/
 data/run/
+data/session/
+data/weixin/
+data/test_ocr.json
 *.db
 *.db-shm
 *.db-wal
