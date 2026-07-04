@@ -17,7 +17,8 @@ verify: daily-reward-check
 
 1. 进入基建后调用 `base_collect()` 工具 → 内置截图通知 → subtask_done('base-collect', ...)
    - 如果 base_collect() 返回 success: false → subtask_done('base-collect', '收菜失败：<error>')，继续下一个子任务
-2. skill_run('credit-shop')
+2. 回到主界面后调用 `credit_shop()` 工具 → 内置截图通知 → subtask_done('credit-shop', ...)
+   - 如果 credit_shop() 返回 success: false → subtask_done('credit-shop', '失败：<error>')，继续下一个子任务
 3. skill_run('recruit')
 4. 检查 [系统上下文] 中的星期和理智：
    - 如果是周六或周日且剿灭未完成 → skill_run('annihilation')

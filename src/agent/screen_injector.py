@@ -127,6 +127,17 @@ class ScreenInjector:
         if config.agent.vision_mode != "auto_inject":
             return []
         if not is_action_tool(tool_calls):
+            # Non-action tools (lifemaker_launch, base_collect, etc.)
+            # may have changed the screen dramatically. Inject if needed.
+            if self.state.last_injected_hash:
+                try:
+                    from src.device.adb import get_adb
+                    from src.utils.hash import compute_image_hash as _cs
+                    img = get_adb().get_screenshot_image()
+                    if _cs(img) != self.state.last_injected_hash:
+                        return self.inject_now()
+                except Exception:
+                    pass
             return []
 
         try:

@@ -16,8 +16,9 @@ subskills:
 
 ## Steps
 
-1. skill_run('lifemakeover-launch')
-   # 启动游戏（biubiu加速器 → 看广告获取时长 → 加速启动 → 标题画面进入 → 关闭弹窗）
+1. 调用 `lifemaker_launch()` 工具 → 内置截图通知 → 等游戏启动 → 点标题画面 → 关弹窗 → subtask_done('lifemakeover-launch', ...)
+   - 工具全自动：启动biubiu → 看3个广告（≥10h跳过）→ 点加速 → 游戏自行启动
+   - 如果 lifemaker_launch() 返回 success: false → 按 lifemakeover-launch 技能手动执行
 2. skill_run('lifemakeover-schedule')
    # 日程任务：签到 → 思绪漫步 → 时尚对决（周一15次/周日5次/平时3次，打高分段对手）
 3. skill_run('lifemakeover-farm')

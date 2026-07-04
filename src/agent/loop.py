@@ -78,6 +78,31 @@ _WAIT_INTENT_KW: frozenset[str] = frozenset({
     "do nothing", "let it auto",
 })
 
+# ── Thinking-action mismatch: thinking says "do X" (click/tap/magnify)
+# but the tool call is adb_back.  MiMo's thinking and tool-use modules
+# sometimes diverge — the thinking correctly identifies the target but
+# the tool-use block defaults to adb_back.  These keywords detect when
+# thinking expresses a SPECIFIC action intent that contradicts a generic
+# back-press.
+_BACK_MISMATCH_ACTION_KW: frozenset[str] = frozenset({
+    # Chinese: the model intends to interact with a specific UI element
+    "点击", "点一下", "点选", "按一下",
+    "标记", "标出", "标注",
+    # English equivalents
+    "click", "tap on", "tap the", "tapping", "i need to tap",
+    "i need to click", "let me tap", "let me click",
+    "i will tap", "i will click", "i'll tap", "i'll click",
+    "mark it", "mark the", "mark its",
+})
+
+# Keywords that indicate a LEGITIMATE intent to press back — when these
+# appear in thinking alongside adb_back, the mismatch check is skipped.
+_BACK_LEGITIMATE_KW: frozenset[str] = frozenset({
+    "返回", "后退", "退回", "回退", "退出", "go back", "press back",
+    "按返回", "按了返回", "误按了返回", "误按返回",
+    "不小心按了返回", "pressed back", "pressing back",
+})
+
 # ── Resource consumption guard constants (module level) ──────────────
 
 # Tier 1 — Strong: explicit consumption-confirmation keywords.
@@ -307,6 +332,7 @@ class TerraAgent:
         self._max_tokens_no_tool_streak: int = 0  # Consecutive max_tokens exhaustion
         self._no_tool_static_streak: int = 0  # Consecutive no-tool + static screen
         self._wait_intent_conflict_streak = 0  # Consecutive wait-intent conflicts
+        self._back_mismatch_streak = 0  # Consecutive back-mismatch (thinking≠adb_back)
         self._dark_screen_since: float = 0.0  # Monotonic timestamp when dark-screen blocking began (0=none)
         self._dark_screen_hash: str = ""      # Screen hash when dark-screen blocking began
         # ── Repeated-thinking detection ──
@@ -1878,39 +1904,13 @@ class TerraAgent:
                             if target and len(target) >= 2 and any(target in ot for ot in _ocr_now):
                                 _targets_on_screen = True
                                 break
-                        # adb_back is NOT safe during loading screens —
-                        # it cancels the navigation and sends you backwards.
-                        # Only exempt if the screen has substantial OCR content.
-                        _only_back = all(tc == "adb_back" for tc in _conflict_tools)
-                        _loading_screen = (
-                            len(self.state.last_ocr_texts or []) < 8
-                            and any(
-                                kw in " ".join(self.state.last_ocr_texts or []).lower()
-                                for kw in _LOADING_SCREEN_KW
-                            )
-                        )
-                        if _only_back and not _targets_on_screen and not _loading_screen:
-                            self._wait_intent_conflict_streak = 0
-                            logger.debug(
-                                "Wait-intent bypass: adb_back retreat allowed (iter %d)",
-                                self.state.iteration_count,
-                            )
-                            # Fall through — don't discard
-                        elif not _targets_on_screen:
+                        # adb_back is never exempt — LLM thinking "wait"
+                        # but pressing back is always contradictory.
+                        # Always discard on first conflict.  Only after
+                        # 3 consecutive conflicts do we let it through.
+                        if not _targets_on_screen:
                             self._wait_intent_conflict_streak += 1
-                            # On the first conflict, if the screen has meaningful
-                            # content (≥8 OCR texts), the screen IS loaded — the
-                            # LLM is just being cautious.  Execute immediately
-                            # instead of wasting a round-trip.
-                            _ocr_count = len(self.state.last_ocr_texts or [])
-                            if self._wait_intent_conflict_streak == 1 and _ocr_count >= 8:
-                                self._wait_intent_conflict_streak = 0
-                                logger.debug(
-                                    "Wait-intent bypassed: screen has %d OCR texts (iter %d)",
-                                    _ocr_count, self.state.iteration_count,
-                                )
-                                # Fall through — execute tools
-                            elif self._wait_intent_conflict_streak >= 3:
+                            if self._wait_intent_conflict_streak >= 3:
                                 # Before executing anyway, check if the screen is
                                 # genuinely still loading.  If OCR contains loading
                                 # keywords (RHODES ISLAND, INFRASTRUCTURE, etc.),
@@ -1961,6 +1961,66 @@ class TerraAgent:
                                 # stale image + correction message.
                                 self.screen_injector.inject_now(fast=True)
                                 continue
+
+            # ── Back-mismatch guard ──
+            # When the LLM's thinking explicitly describes clicking/tapping/
+            # marking a specific UI element but the tool call is adb_back,
+            # the MiMo thinking and tool-use modules have diverged.
+            # Discard the contradictory response and inject a correction.
+            #
+            # Only triggers when:
+            #   - thinking has action keywords (点击, click, tap, magnify, mark)
+            #   - first tool call is adb_back
+            #   - thinking does NOT mention back/return intent (legitimate use)
+            #
+            # Streak escape: after 2 consecutive mismatches, force-execute
+            # the adb_back anyway — prevents infinite correction loops.
+            if thinking and tool_calls:
+                _thinking_lower2 = thinking.lower()
+                _action_hit = any(kw in _thinking_lower2 for kw in _BACK_MISMATCH_ACTION_KW)
+                if _action_hit:
+                    _first_tool = tool_calls[0]["name"]
+                    if _first_tool == "adb_back":
+                        _legit = any(kw in _thinking_lower2 for kw in _BACK_LEGITIMATE_KW)
+                        if not _legit:
+                            self._back_mismatch_streak += 1
+                            if self._back_mismatch_streak >= 2:
+                                logger.warning(
+                                    "Back-mismatch streak=%d — executing adb_back anyway (iter %d)",
+                                    self._back_mismatch_streak,
+                                    self.state.iteration_count,
+                                )
+                                self._back_mismatch_streak = 0
+                                self.state.add_message("user",
+                                    "[系统提醒] 已连续2轮思考与操作矛盾。"
+                                    "先执行 adb_back()，看看效果。")
+                                # Fall through — execute adb_back
+                            else:
+                                logger.warning(
+                                    "Back-mismatch: thinking says act (%s) but tool is adb_back "
+                                    "(iter %d, streak=%d/2). Discarding response.",
+                                    [kw for kw in _BACK_MISMATCH_ACTION_KW if kw in _thinking_lower2],
+                                    self.state.iteration_count,
+                                    self._back_mismatch_streak,
+                                )
+                                self.state.add_message("user",
+                                    "[系统 — 检测到矛盾] 你的思考中明确说要点击/标记某个按钮，"
+                                    "但你调用了 adb_back() 返回键。这二者矛盾！\n"
+                                    "请根据你的思考来操作：如果要点击按钮 → 用 magnify/tap_magnified。"
+                                    "如果确实需要返回 → 思考中应该写'需要返回'而不是'点击'。"
+                                    "**禁止**：思考写'点击X'但实际操作是 adb_back()。"
+                                    f"连续 {self._back_mismatch_streak}/2 次矛盾后系统自动放行。")
+                                self.screen_injector.inject_now(fast=True)
+                                continue
+                        else:
+                            # Legitimate back — reset streak
+                            self._back_mismatch_streak = 0
+                    else:
+                        # Different tool — reset streak
+                        self._back_mismatch_streak = 0
+                else:
+                    # No action keywords — reset streak
+                    self._back_mismatch_streak = 0
 
             # Record assistant message with tool calls
             self.loop_guard.reset_action_counters()
@@ -2399,6 +2459,7 @@ class TerraAgent:
                     if _tool_success:
                         any_action_succeeded = True
                         self._wait_intent_conflict_streak = 0  # P0: reset conflict streak
+                        self._back_mismatch_streak = 0  # Reset back-mismatch streak
                     elif _parsed:
                         self._capture_failure(
                             "tool_failure", tool_name, tool_input,

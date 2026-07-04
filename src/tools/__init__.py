@@ -10,9 +10,11 @@ from src.tools import base_collect_tool  # noqa: F401
 from src.tools import base_shift_tool  # noqa: F401
 from src.tools import box_scan_tool  # noqa: F401
 from src.tools import confidence  # noqa: F401
+from src.tools import credit_shop_tool  # noqa: F401
 from src.tools import depot_scan_tool  # noqa: F401
 from src.tools import emulator_tools  # noqa: F401
 from src.tools import knowledge_tool  # noqa: F401
+from src.tools import lifemaker_launch_tool  # noqa: F401
 from src.tools import material_tools  # noqa: F401
 
 from src.tools import learn  # noqa: F401

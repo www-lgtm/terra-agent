@@ -1525,7 +1525,12 @@ registry.register(
 
 registry.register(
     name="adb_back",
-    description="Press Android back button to return to previous screen.",
+    description=(
+        "Press Android back button to go back or dismiss a popup. "
+        "ONLY use when you genuinely need to navigate backward. "
+        "NEVER use as a substitute for clicking buttons — if your thinking "
+        "mentions tapping/clicking something, use magnify/tap_magnified instead."
+    ),
     parameters={"type": "object", "properties": {}},
     handler=adb_back,
     check_fn=_adb_available,

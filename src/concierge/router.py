@@ -760,8 +760,11 @@ class MessageRouter:
             # "清体力", "刷GT-6", "完成日常" all go directly to agent.
             if self._is_simple_single_task(text):
                 from config.settings import config
-                game = self.game_ctx.active_game if self.game_ctx else config.state.game
-                logger.info("Simple single-task detected — skipping concierge LLM: %s", text[:80])
+                from src.agent.router import detect_game
+                game = detect_game(text)
+                if not game or game == config.state.game:
+                    game = self.game_ctx.active_game if self.game_ctx else config.state.game
+                logger.info("Simple single-task detected — skipping concierge LLM: %s (game=%s)", text[:80], game)
                 return CONCIERGE_TOOL_DISPATCH["delegate_to_agent"](
                     self, task=text, game=game, task_type="custom",
                 )

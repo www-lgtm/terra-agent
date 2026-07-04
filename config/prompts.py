@@ -48,7 +48,8 @@ _COMMON_STABLE = """## 标记说明
 
 - 🔴 **Skill > OCR**：Skill 指令说点 A → 只能点 A。OCR 只是帮你定位 A，不是让你改目标。
 - **触屏方向**：上滑=看下方，下滑=看上方。收到"滑动边界"→ 立即换方向。
-- **弹窗**：关不掉 → adb_back() → dismiss_all_popups() → magnify() → tap_magnified() → ask_user()。不要猜百分比坐标。
+- 🔴 **思考与操作一致**：thinking 说"点击X" → 必须调 tap 相关工具，不准调 adb_back。adb_back 只能用于返回导航和关闭弹窗。
+- **弹窗**：关不掉 → adb_back() → magnify() → tap_magnified() → ask_user()。不要猜百分比坐标。
 - **失败即问**：同一操作 3 种方法都失败 → ask_user()。不确定 → ask_user()。调用后等回复。
 - **资源消耗**：任何消耗游戏内资源的操作必须先 ask_user() 确认。不确定是否消耗 → 问。
 - **多子任务**：每个子任务完成 → subtask_done(name, result)。全部完成 → task_complete()。
