@@ -50,8 +50,10 @@ _ITEM_GRID_Y_BOT = 0.95         # Bottom of item grid
 _OUT_OF_STOCK_MARKERS = ("OUTOFST", "OFSTOCK")
 
 # Confirmation dialog keywords
-_CONFIRM_KW = ("确认", "购买", "确定", "是")
-_POPUP_KW = ("获得物品", "获得")
+_CONFIRM_KW = ("确认", "购买", "确定", "是", "花费", "CONFIRM")
+_POPUP_KW = ("获得物品", "获得", "GET", "ITEM")
+# Popups that may appear on the credit shop screen (before the shop grid)
+_SHOP_POPUP_KW = ("好友", "剿灭", "得分", "最高", "记录", "FRIEND", "ANNIHILATION")
 
 # Timing
 _CLICK_DELAY = 0.5
@@ -118,6 +120,8 @@ def _wait_for_text_gone(adb, keywords: tuple[str, ...], timeout: float = 3.0) ->
 
 def _find_and_tap(adb, target: str, w: int, h: int,
                   y_min: int = 0, y_max: int = 99999) -> bool:
+    """OCR-scan the screen for `target` text and tap its center.
+    Returns True if found and tapped, False otherwise."""
     dets = ocr_engine.read_text(adb.get_screenshot_image())
     for d in dets:
         cy = d["center"][1]
@@ -125,8 +129,13 @@ def _find_and_tap(adb, target: str, w: int, h: int,
             continue
         if target in d["text"]:
             cx, cy = d["center"]
+            logger.info("credit_shop: found '%s' at (%d,%d), tapping", target, cx, cy)
             adb.shell("input", "tap", str(cx), str(cy))
             return True
+    # Diagnostic: log what was found in the target area
+    nearby = [d["text"] for d in dets if y_min <= d["center"][1] <= y_max]
+    logger.info("credit_shop: '%s' not found in y [%d,%d]. Nearby texts: %s",
+               target, y_min, y_max, ", ".join(nearby[:15]))
     return False
 
 
@@ -141,23 +150,33 @@ def _item_priority(name: str) -> int:
 def _scan_items(adb, w: int, h: int) -> list[dict]:
     """Scan the credit shop grid for available items.
 
-    The shop is a 5-column × 2-row grid.  We partition the screen into 5
-    equal-width columns, then check each column's upper and lower halves.
-    Items marked OUTOFST/OFSTOCK are skipped.
+    The shop is a 5-column × 2-row grid.  We scan the full item area
+    with generous bounds, collect ALL OCR detections for diagnostic
+    logging, then partition into columns to extract name+price pairs.
     """
     col_w = w // _GRID_COLS
-    y_top = int(h * _ITEM_GRID_Y_TOP)
-    y_mid = int(h * _ITEM_GRID_Y_MID)
-    y_bot = int(h * _ITEM_GRID_Y_BOT)
+    y_top = int(h * 0.22)       # Start higher — header area
+    y_mid = int(h * 0.58)       # Split between upper/lower rows
+    y_bot = int(h * 0.88)       # End lower — below the grid
 
     dets = ocr_engine.read_text(adb.get_screenshot_image())
 
     # Filter to item area
-    dets = [d for d in dets if y_top <= d["center"][1] <= y_bot]
+    area_dets = [d for d in dets if y_top <= d["center"][1] <= y_bot]
 
-    # Diagnostic
-    logger.info("credit_shop: %d OCR detections in item area (y %d-%d)",
-               len(dets), y_top, y_bot)
+    # ── Diagnostic: log ALL OCR detections in the item area ──
+    logger.info("credit_shop: %d total OCR detections, %d in item area (y %d-%d)",
+               len(dets), len(area_dets), y_top, y_bot)
+    for d in sorted(area_dets, key=lambda d: (d["center"][1], d["center"][0])):
+        logger.info("credit_shop:   OCR [%s] at (%d,%d) bbox=(%d,%d,%d,%d)",
+                   d["text"], d["center"][0], d["center"][1],
+                   d["bbox"][0], d["bbox"][1], d["bbox"][2], d["bbox"][3])
+
+    # ── Check for "信用交易所" / "信用" header to verify we're on the right screen ──
+    shop_header_found = any("信用" in d["text"] for d in dets
+                           if d["center"][1] < int(h * 0.15))
+    if not shop_header_found:
+        logger.warning("credit_shop: credit shop header NOT found — may not be on shop screen")
 
     items: list[dict] = []
 
@@ -165,7 +184,7 @@ def _scan_items(adb, w: int, h: int) -> list[dict]:
         x_min = col * col_w
         x_max = (col + 1) * col_w
 
-        col_dets = [d for d in dets if x_min <= d["center"][0] <= x_max]
+        col_dets = [d for d in area_dets if x_min <= d["center"][0] <= x_max]
 
         # Split into upper (row 1) and lower (row 2)
         upper = [d for d in col_dets if d["center"][1] < y_mid]
@@ -175,53 +194,62 @@ def _scan_items(adb, w: int, h: int) -> list[dict]:
             if not band_dets:
                 continue
 
-            # Check for out-of-stock markers
             band_texts = " ".join(d["text"] for d in band_dets)
+
+            # Check for out-of-stock markers
             if any(m in band_texts for m in _OUT_OF_STOCK_MARKERS):
                 continue
 
-            # Find price: an integer in a plausible range (10-500)
+            # Find price: look for numbers in plausible range (10-600)
+            # Credit shop prices: typically 25-400, but be generous
             price = 0
             for d in band_dets:
                 t = d["text"].strip()
-                # Clean up OCR glitches like "16080" → 160
-                m = re.match(r'^(\d{2,3})(?:\d{2})?$', t)
-                if m:
-                    p = int(m.group(1))
-                    if 10 <= p <= 500:
-                        price = p
-                        break
-                m = re.match(r'^(\d{2,3})$', t)
-                if m:
-                    p = int(m.group(1))
-                    if 10 <= p <= 500:
-                        price = p
-                        break
+                # Try various patterns: pure number, discount with slash, etc.
+                for pat in [
+                    r'^(\d{2,4})$',                      # pure number like "100", "360"
+                    r'(\d{2,3})/(\d{2,3})',              # discount like "80/160"
+                ]:
+                    m = re.search(pat, t)
+                    if m:
+                        p = int(m.group(1))
+                        if 10 <= p <= 600:
+                            price = p
+                            break
+                if price:
+                    break
 
             if not price:
+                # Log unrecognized texts for debugging
+                logger.info("credit_shop: col %d %s — no price found, texts: %s",
+                           col, band_name, band_texts)
                 continue
 
-            # Find name: longest Chinese-like text in this band (not a number)
+            # Find name: longest text in this band that isn't a number
             name = ""
             for d in band_dets:
                 t = d["text"].strip()
-                if len(t) < 2:
+                if len(t) < 1:
                     continue
+                # Skip discount badges
                 if re.match(r'^[-−]?\d{1,3}%$', t):
-                    continue  # discount badge
-                if re.match(r'^\d{1,4}$', t):
-                    continue  # pure number
+                    continue
+                # Skip pure numbers and number/slash combos
+                if re.match(r'^\d{1,4}$', t) or re.match(r'^\d{2,3}/\d{2,3}$', t):
+                    continue
+                # Skip out-of-stock markers
                 if any(m in t for m in _OUT_OF_STOCK_MARKERS):
                     continue
-                if "EXPEDITED" in t or "PLAN" in t:
-                    continue  # English labels, not item names
+                # Skip English-only labels
+                if t.isascii() and len(t) < 3:
+                    continue
                 if len(t) > len(name):
                     name = t
 
             if name and price:
-                # Click target: center of column, average Y of name+price
-                ys = [d["center"][1] for d in band_dets if len(d["text"].strip()) >= 2]
-                click_y = sum(ys) // len(ys) if ys else (y_top + y_mid) // 2
+                # Click target: center of column, average Y of the band
+                band_ys = [d["center"][1] for d in band_dets]
+                click_y = sum(band_ys) // len(band_ys)
                 click_x = (x_min + x_max) // 2
 
                 items.append({
@@ -231,6 +259,14 @@ def _scan_items(adb, w: int, h: int) -> list[dict]:
                     "col": col,
                     "click": (click_x, click_y),
                 })
+
+    # ── Diagnostic summary ──
+    if not items:
+        logger.warning("credit_shop: NO items extracted from %d area detections. "
+                       "Full OCR text in area: %s",
+                       len(area_dets),
+                       ", ".join(f"'{d['text']}'" for d in sorted(
+                           area_dets, key=lambda d: d["center"][1])))
 
     return items
 
@@ -256,14 +292,44 @@ def credit_shop() -> ToolOutput:
     time.sleep(0.5)
 
     # ── Step 2: Navigate to 信用交易所 ───────────────────────────────
-    if not _find_and_tap(adb, "信用交易所", w, h, y_max=int(h * 0.25)):
-        return _error("未找到信用交易所入口，请在采购中心界面重试")
+    # "信用交易所" may appear anywhere on the procurement screen — don't
+    # restrict to top 25%.  Fall back to a second attempt with back+retry.
+    if not _find_and_tap(adb, "信用交易所", w, h):
+        # Maybe we're not on the procurement screen — try going back and
+        # tapping 采购中心 again with fixed position
+        logger.warning("credit_shop: 信用交易所 not found, retrying navigation")
+        adb.press_back()
+        time.sleep(0.6)
+        sx, sy = int(w * _MAIN_STORE_PCT[0]), int(h * _MAIN_STORE_PCT[1])
+        adb.shell("input", "tap", str(sx), str(sy))
+        time.sleep(1.5)
+        if not _find_and_tap(adb, "信用交易所", w, h):
+            return _error("未找到信用交易所入口，请在采购中心界面手动操作后重试")
 
     time.sleep(0.8)
 
     # ── Step 3: Collect daily credits ────────────────────────────────
     _find_and_tap(adb, "收取信用", w, h, y_max=int(h * 0.15))
     time.sleep(1.0)
+
+    # ── Step 3.5: Dismiss any overlay popups (friend annihilation score, etc.) ─
+    # These popups appear on top of the shop grid and block item scanning.
+    for _attempt in range(3):
+        dets = ocr_engine.read_text(adb.get_screenshot_image())
+        popup_hit = any(
+            any(kw in d["text"] for kw in _SHOP_POPUP_KW)
+            for d in dets if d["center"][1] > int(h * 0.25)
+        )
+        if not popup_hit:
+            break
+        logger.info("credit_shop: shop popup detected, dismissing (attempt %d)", _attempt + 1)
+        # Try tapping center-right (common close button area) then back
+        adb.shell("input", "tap", str(int(w * 0.85)), str(int(h * 0.15)))
+        time.sleep(0.5)
+        adb.press_back()
+        time.sleep(0.5)
+    else:
+        logger.warning("credit_shop: shop popup may still be present after %d attempts", 3)
 
     # ── Step 4: Scan items ───────────────────────────────────────────
     items = _scan_items(adb, w, h)
@@ -283,21 +349,35 @@ def credit_shop() -> ToolOutput:
     # ── Step 5: Build purchase plan ──────────────────────────────────
     items.sort(key=lambda i: (i["priority"], i["price"]))
 
-    # Read budget
-    budget = 300
-    for d in ocr_engine.read_text(adb.get_screenshot_image()):
-        m = re.search(r'(\d{2,3})/(\d{3})', d["text"])
+    # Read budget from the credit counter at the top of the screen.
+    # Format: "信用 123/300" or just a bare number like "200".
+    budget = 300  # default
+    shop_dets = ocr_engine.read_text(adb.get_screenshot_image())
+    # Look for "信用" or "CREDIT" near the top of the screen
+    for d in shop_dets:
+        if d["center"][1] > int(h * 0.20):
+            continue  # Budget is always top-left area
+        t = d["text"].strip()
+        # Pattern: "123/300" or "信用 123"
+        m = re.search(r'(\d{2,4})\s*/\s*\d{2,4}', t)
         if m:
             budget = int(m.group(1))
+            logger.info("credit_shop: budget=%d from text '%s'", budget, t)
             break
     if budget == 300:
-        # Try just a bare number near the top
-        for d in ocr_engine.read_text(adb.get_screenshot_image()):
-            if d["center"][1] < 100:
-                m = re.match(r'^(\d{2,3})$', d["text"].strip())
-                if m and 0 < int(m.group(1)) <= 300:
-                    budget = int(m.group(1))
-                    break
+        # Try bare number near the top that looks like a credit count
+        for d in shop_dets:
+            if d["center"][1] > int(h * 0.12):
+                continue
+            t = d["text"].strip()
+            m = re.match(r'^(\d{2,4})$', t)
+            if m and 0 < int(m.group(1)) <= 300:
+                budget = int(m.group(1))
+                logger.info("credit_shop: budget=%d from bare number '%s'", budget, t)
+                break
+    # Log all top-20% texts for budget debugging
+    top_texts = [d["text"] for d in shop_dets if d["center"][1] < int(h * 0.20)]
+    logger.info("credit_shop: top texts for budget: %s", ", ".join(top_texts))
 
     plan: list[dict] = []
     remaining = budget
@@ -311,7 +391,8 @@ def credit_shop() -> ToolOutput:
                ", ".join(f"{i['name']}({i['price']})" for i in plan))
 
     if not plan:
-        _notify_screenshot(f"信用商店：余额不足（信用{budget}）")
+        item_list = ", ".join(f"{i['name']}({i['price']})" for i in items)
+        _notify_screenshot(f"信用商店：余额不足（信用{budget}），有{len(items)}件商品：{item_list}")
         adb.press_back()
         time.sleep(0.5)
         adb.press_back()
