@@ -2308,25 +2308,34 @@ class TerraAgent:
                     _min_iters = 20 if len(skills) > 1 else 8
                     _blocked = False
                     if self.state.iteration_count < _min_iters:
-                        _all_done = _completed and len(skills) > 1 and all(
-                            s["name"] in _completed for s in skills
-                            if s.get("type") != "orchestrator"
-                        )
-                        if not _all_done:
+                        # Non-orchestrator skills that still need work
+                        _pending = [
+                            s for s in skills
+                            if s.get("type") != "orchestrator" and s["name"] not in _completed
+                        ]
+                        # Let through if all subtasks already done — deterministic
+                        # tools like credit_shop/base_collect complete in 1 call.
+                        if not _pending and _completed:
+                            logger.info(
+                                "task_complete early: all %d subtask(s) done at iter=%d — allowing",
+                                len(_completed), self.state.iteration_count,
+                            )
+                            # Fall through — don't block
+                        elif _pending:
                             if len(skills) > 1:
                                 skill_names = [s["name"] for s in skills]
                                 logger.warning(
-                                    "task_complete BLOCKED: %d skills at iter=%d: %s",
-                                    len(skills), self.state.iteration_count, skill_names,
+                                    "task_complete BLOCKED: %d skills at iter=%d, pending=%s",
+                                    len(skills), self.state.iteration_count, [s["name"] for s in _pending],
                                 )
                                 self.state.add_message("user",
                                     f"[系统提示] 匹配了 {len(skills)} 个子任务: {', '.join(skill_names)}。"
-                                    f"才跑了 {self.state.iteration_count} 轮，不太可能全做完。"
+                                    f"还有 {len(_pending)} 个未完成，才跑了 {self.state.iteration_count} 轮。"
                                     f"继续执行剩余任务。全做完后再调 task_complete。")
                             else:
                                 logger.warning(
-                                    "task_complete BLOCKED: single skill at iter=%d",
-                                    self.state.iteration_count,
+                                    "task_complete BLOCKED: single skill at iter=%d, pending=%s",
+                                    self.state.iteration_count, [s["name"] for s in _pending],
                                 )
                                 self.state.add_message("user",
                                     f"[系统提示] 才跑了 {self.state.iteration_count} 轮，"

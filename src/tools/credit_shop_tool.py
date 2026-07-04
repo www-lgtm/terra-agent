@@ -52,8 +52,6 @@ _OUT_OF_STOCK_MARKERS = ("OUTOFST", "OFSTOCK")
 # Confirmation dialog keywords
 _CONFIRM_KW = ("确认", "购买物品", "购买", "确定", "是", "花费", "CONFIRM", "BUY")
 _POPUP_KW = ("获得物品", "获得", "GET", "ITEM")
-# Popups that may appear on the credit shop screen (before the shop grid)
-_SHOP_POPUP_KW = ("好友", "剿灭", "得分", "最高", "记录", "FRIEND", "ANNIHILATION")
 
 # Timing
 _CLICK_DELAY = 0.5
@@ -200,32 +198,53 @@ def _scan_items(adb, w: int, h: int) -> list[dict]:
             if any(m in band_texts for m in _OUT_OF_STOCK_MARKERS):
                 continue
 
+            # ── Check for discount badge ──
+            has_discount = any(
+                re.search(r'[-−]\d{1,2}%', d["text"]) for d in band_dets
+            )
+
             # Find price: look for numbers in plausible range (10-600).
-            # OCR frequently glues the price to adjacent numbers:
-            #   160 → "16040", 200 → "20050" or "200100"
-            # Strategy: try clean numbers first, then extract leading digits.
+            # OCR frequently glues original+discounted price together:
+            #   "16040" = 160 original + 40 discounted
+            #   "20050" = 200 original + 50 discounted
+            #   "200100" = 200 original + 100 discounted
+            # When a discount badge (-75%, -50%) exists, the REAL price is
+            # the trailing 2-3 digits.  Without discount, it's the first 3.
             price = 0
             for d in band_dets:
                 t = d["text"].strip()
-                # 1) Clean number: "200", "160"
+                # 1) Clean number: "40", "160", "200"
                 m = re.match(r'^(\d{2,3})$', t)
                 if m and 10 <= int(m.group(1)) <= 600:
                     price = int(m.group(1))
                     break
-                # 2) Discount: "80/160"
+                # 2) Discount slash: "80/160"
                 m = re.search(r'(\d{2,3})/(\d{2,3})', t)
                 if m:
                     p = int(m.group(1))
                     if 10 <= p <= 600:
                         price = p
                         break
-                # 3) OCR-glued: "16040"→160, "20050"→200, "200100"→200
-                #    Take the first 3-digit chunk that's a plausible price
-                m = re.match(r'^(\d{3})(?:\d{2,3})$', t)
-                if m and 10 <= int(m.group(1)) <= 600:
-                    price = int(m.group(1))
-                    break
-
+                # 3) OCR-glued 5-digit: "16040" → 40 (discounted) or 160 (full)
+                m = re.match(r'^(\d{3})(\d{2})$', t)
+                if m:
+                    full_p, disc_p = int(m.group(1)), int(m.group(2))
+                    if has_discount and 10 <= disc_p <= 300:
+                        price = disc_p
+                    elif 10 <= full_p <= 600:
+                        price = full_p
+                    if price:
+                        break
+                # 4) OCR-glued 6-digit: "200100" → 100 (discounted) or 200 (full)
+                m = re.match(r'^(\d{3})(\d{3})$', t)
+                if m:
+                    full_p, disc_p = int(m.group(1)), int(m.group(2))
+                    if has_discount and 10 <= disc_p <= 300:
+                        price = disc_p
+                    elif 10 <= full_p <= 600:
+                        price = full_p
+                    if price:
+                        break
             if not price:
                 # Log unrecognized texts for debugging
                 logger.info("credit_shop: col %d %s — no price found, texts: %s",
@@ -324,27 +343,41 @@ def credit_shop() -> ToolOutput:
     time.sleep(0.8)
 
     # ── Step 3: Collect daily credits ────────────────────────────────
-    _find_and_tap(adb, "收取信用", w, h, y_max=int(h * 0.15))
-    time.sleep(1.0)
+    if _find_and_tap(adb, "收取信用", w, h, y_max=int(h * 0.15)):
+        time.sleep(1.0)
+        # Check if a popup appeared — popups reduce OCR dramatically
+        _post_collect = ocr_engine.read_text(adb.get_screenshot_image())
+        if len(_post_collect) < 20:
+            logger.info("credit_shop: popup detected after credit collect (ocr=%d), dismissing",
+                       len(_post_collect))
+            adb.press_back()
+            time.sleep(0.5)
+        else:
+            logger.info("credit_shop: no popup after credit collect (ocr=%d)", len(_post_collect))
+    else:
+        logger.info("credit_shop: 收取信用 not found — credits already collected today")
 
-    # ── Step 3.5: Dismiss any overlay popups (friend annihilation score, etc.) ─
-    # These popups appear on top of the shop grid and block item scanning.
-    for _attempt in range(3):
+    # ── Step 3.5: Ensure shop grid is visible ──────────────────────────
+    # Normal credit shop has 40-55 OCR texts in the item area.  If we see
+    # far fewer, a popup/dialog is blocking the view — press back and retry.
+    _grid_y_top = int(h * 0.20)
+    _grid_y_bot = int(h * 0.90)
+    for _attempt in range(4):
         dets = ocr_engine.read_text(adb.get_screenshot_image())
-        popup_hit = any(
-            any(kw in d["text"] for kw in _SHOP_POPUP_KW)
-            for d in dets if d["center"][1] > int(h * 0.25)
-        )
-        if not popup_hit:
+        area_count = sum(1 for d in dets
+                        if _grid_y_top <= d["center"][1] <= _grid_y_bot)
+        total = len(dets)
+        if total >= 20 and area_count >= 15:
             break
-        logger.info("credit_shop: shop popup detected, dismissing (attempt %d)", _attempt + 1)
-        # Try tapping center-right (common close button area) then back
-        adb.shell("input", "tap", str(int(w * 0.85)), str(int(h * 0.15)))
-        time.sleep(0.5)
+        logger.info(
+            "credit_shop: low OCR (total=%d area=%d, attempt %d) — "
+            "popup likely blocking grid, pressing back",
+            total, area_count, _attempt + 1,
+        )
         adb.press_back()
         time.sleep(0.5)
     else:
-        logger.warning("credit_shop: shop popup may still be present after %d attempts", 3)
+        logger.warning("credit_shop: grid still obstructed after 4 attempts")
 
     # ── Step 4: Scan items ───────────────────────────────────────────
     items = _scan_items(adb, w, h)
@@ -466,10 +499,26 @@ def credit_shop() -> ToolOutput:
     )
 
     # ── Step 8: Return to main screen ────────────────────────────────
-    adb.press_back()
-    time.sleep(0.5)
-    adb.press_back()
-    time.sleep(0.3)
+    # Press back until we see main screen keywords, but stop and cancel
+    # if we accidentally trigger the exit-game dialog.
+    _MAIN_SCREEN_KW = ("采购中心", "基建", "Terminal", "档案", "任务", "编队")
+    _EXIT_DIALOG_KW = ("退出游戏", "确认退出")
+    for _back_step in range(4):
+        _back_dets = ocr_engine.read_text(adb.get_screenshot_image())
+        _back_texts = " ".join(d["text"] for d in _back_dets)
+        if any(kw in _back_texts for kw in _EXIT_DIALOG_KW):
+            logger.warning("credit_shop: hit exit dialog, cancelling")
+            _find_and_tap(adb, "取消", w, h)
+            time.sleep(0.4)
+            # Now we should be on main screen
+            break
+        if any(kw in _back_texts for kw in _MAIN_SCREEN_KW):
+            logger.info("credit_shop: back to main screen confirmed (step %d)", _back_step)
+            break
+        adb.press_back()
+        time.sleep(0.5)
+    else:
+        logger.warning("credit_shop: could not confirm return to main screen")
 
     logger.info("credit_shop: done — %d/%d items bought", len(bought), len(plan))
 
