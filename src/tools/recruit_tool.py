@@ -57,7 +57,8 @@ def _load_known_tags() -> None:
 # ── Verified coordinates (1920×1080 landscape, as percentages) ─────────
 
 # Hour ▼ — tap once to go from 01 → 09 (wraps around)
-_HOUR_DOWN = (0.62, 0.24)
+# Verified: (668, 445) on 1920×1080 from run_20260701_135026.log
+_HOUR_DOWN = (0.35, 0.41)
 
 # Confirm ✓ — verified: (1440, 860) on 1920×1080
 _CONFIRM_PCT = (0.75, 0.80)
@@ -273,6 +274,16 @@ def _set_9h(adb, w: int, h: int):
     logger.info("recruit: set 9h — tap ▼ at (%d,%d)", hx, hy)
     adb.shell("input", "tap", str(hx), str(hy))
     time.sleep(0.3)
+    # Verify: OCR should show '09 : 00' now, not '01 : 00'
+    after = ocr_engine.read_text(adb.get_screenshot_image())
+    for d in after:
+        if '09' in d["text"] and '00' in d["text"]:
+            logger.info("recruit: set 9h — verified 09:00 in OCR")
+            return
+    # Time didn't change — try again with slightly different Y
+    logger.warning("recruit: set 9h — time not confirmed in OCR, retrying")
+    adb.shell("input", "tap", str(hx), str(hy + int(h * 0.02)))
+    time.sleep(0.3)
 
 
 # ── Confirm ─────────────────────────────────────────────────────────────
@@ -377,6 +388,11 @@ def _start_new_recruits(adb, w: int, h: int, contacts: int,
     for _round in range(max_rounds):
         empty_slots = _find_all_ocr(adb, "开始招募干员")
         if not empty_slots:
+            # Log what IS visible so we can debug the "missing 4th slot" issue
+            all_texts = [d["text"] for d in ocr_engine.read_text(adb.get_screenshot_image())
+                        if d["center"][1] > int(h * 0.50)]
+            logger.info("recruit: phase2 — no more empty slots. Screen texts (bottom half): %s",
+                       sorted(set(all_texts)))
             break
 
         # Take first (topmost) empty slot

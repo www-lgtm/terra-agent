@@ -24,6 +24,19 @@ from src.tools.registry import ToolOutput, registry
 
 logger = logging.getLogger(__name__)
 
+
+def _notify_screenshot(message: str) -> None:
+    """Send screenshot + message to user via WeChat notification."""
+    try:
+        from src.agent.screen_injector import capture_screen_jpeg
+        ctx = getattr(threading.current_thread(), '_terra_agent_ctx', None)
+        if ctx is None:
+            return
+        ctx._notify(message, notify_type="screenshot", image_b64=capture_screen_jpeg())
+        logger.info("base_shift: notify — %s", message[:120])
+    except Exception:
+        logger.warning("base_shift: notify failed", exc_info=True)
+
 # ── DLL discovery ──────────────────────────────────────────────────────
 
 def _build_maa_dir_candidates() -> list[Path]:
@@ -619,4 +632,342 @@ registry.register(
         },
     },
     handler=base_shift_maa,
+)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# base_plan — show all facility×operator plans from optimizer
+# ═══════════════════════════════════════════════════════════════════════
+
+_FACILITY_NAMES: dict[str, str] = {
+    "control": "控制中枢", "trading": "贸易站", "manufacture": "制造站",
+    "power": "发电站", "dormitory": "宿舍", "meeting": "会客室",
+    "hire": "办公室", "processing": "加工站",
+}
+
+_CONFIG_NAMES: dict[str, str] = {
+    "orundum": "搓玉", "lmd": "龙门币", "combat_record": "作战记录",
+}
+
+
+def base_plan() -> ToolOutput:
+    """Generate ALL feasible base scheduling plans for the user to choose from.
+
+    Runs the SA optimizer on the latest operator box (default layout 243)
+    and returns every plan on the Pareto frontier — from pure 搓玉 to pure
+    练级.  No warehouse data required.
+
+    The LLM reads the plan summaries and helps the user pick the best one.
+    """
+    from src.intelligence.arknights.base_optimizer import BaseOptimizer, parse_inventory
+    from src.intelligence.arknights.base_scheduler import BaseScheduler
+
+    # ── 1. Load operator box ───────────────────────────────────────
+    operator_box: dict[str, int] = {}
+    cache = BaseScheduler._get_cache()
+    if cache and cache.get("box"):
+        operator_box = cache["box"]
+        logger.info("base_plan: loaded %d ops from scheduler cache", len(operator_box))
+
+    if not operator_box:
+        from src.intelligence.arknights.base_chain import SESSION_DIR, read_box_file
+        if SESSION_DIR.exists():
+            sessions = sorted(
+                [s for s in SESSION_DIR.iterdir()
+                 if s.is_dir() and (s / "box.json").exists()],
+                key=lambda p: p.stat().st_mtime, reverse=True,
+            )
+            if sessions:
+                try:
+                    box_data = read_box_file(sessions[0].name)
+                    if box_data and len(box_data) > 2:
+                        operator_box = box_data
+                        logger.info("base_plan: loaded %d ops from session %s",
+                                   len(operator_box), sessions[0].name)
+                except Exception as e:
+                    logger.warning("base_plan: failed to load box: %s", e)
+
+    if not operator_box or len(operator_box) <= 2:
+        return ToolOutput(text=json.dumps({
+            "success": False,
+            "error": "没有干员数据",
+            "message": "请先 scan_operator_box() 扫描干员列表。",
+        }, ensure_ascii=False))
+
+    # ── 2. Load depot (optional) ───────────────────────────────────
+    depot_stock = _load_depot_stock(cache)
+
+    # ── 3. Knowledge context ───────────────────────────────────────
+    from src.intelligence.base import IntelligenceContext
+    ctx = IntelligenceContext(game="arknights", knowledge=None)
+    try:
+        from src.knowledge import KnowledgeBase
+        ctx.knowledge = KnowledgeBase()
+    except Exception:
+        pass
+
+    # ── 4. Run optimizer on 243 (most universal layout) ────────────
+    inventory = parse_inventory("")
+    NEUTRAL = (0.40, 0.35, 0.25)
+    layout = "243"
+
+    try:
+        optimizer = BaseOptimizer(ctx.knowledge)
+        logger.info("base_plan: optimizing layout=%s operators=%d", layout, len(operator_box))
+        frontier = optimizer.solve_pareto(
+            operator_box, layout, num_shifts=0,
+            sort_weights=NEUTRAL,
+            inventory=inventory,
+            mood_threshold=0.35,
+            material_stock=depot_stock,
+        )
+        if not frontier:
+            return ToolOutput(text=json.dumps({
+                "success": False,
+                "error": "无法生成方案",
+                "message": "当前干员列表无法填满布局。",
+            }, ensure_ascii=False))
+        coverage = frontier[0].coverage if frontier else 0
+
+        # ── Dedup by actual daily output ─────────────────────────────
+        # The optimizer uses normalized efficiency (0-1) for Pareto, so two
+        # plans with the same raw output but different efficiencies both
+        # survive.  To the user, "37,500 LMD + 0 record" and
+        # "37,500 LMD + 30 records" look like a bug — the latter strictly
+        # dominates.  Remove strictly-dominated-by-raw-output plans.
+        _output_map: dict[tuple[int, int, int], int] = {}
+        _keep: list[bool] = [True] * len(frontier)
+        for pi, plan in enumerate(frontier):
+            key = (
+                int(plan.daily_orundum),
+                int(plan.daily_lmd),
+                int(plan.daily_combat_record),
+            )
+            if key in _output_map:
+                # Same raw output — keep the one with better coverage (or first)
+                existing = _output_map[key]
+                if plan.coverage > frontier[existing].coverage:
+                    _keep[existing] = False
+                    _output_map[key] = pi
+                else:
+                    _keep[pi] = False
+            else:
+                _output_map[key] = pi
+
+        # Also remove plans that are strictly dominated in raw output
+        for pi, plan in enumerate(frontier):
+            if not _keep[pi]:
+                continue
+            for pj, other in enumerate(frontier):
+                if pi == pj or not _keep[pj]:
+                    continue
+                a_o, a_l, a_c = int(plan.daily_orundum), int(plan.daily_lmd), int(plan.daily_combat_record)
+                b_o, b_l, b_c = int(other.daily_orundum), int(other.daily_lmd), int(other.daily_combat_record)
+                if b_o >= a_o and b_l >= a_l and b_c >= a_c and (b_o > a_o or b_l > a_l or b_c > a_c):
+                    _keep[pi] = False
+                    break
+
+        frontier = [p for pi, p in enumerate(frontier) if _keep[pi]]
+        logger.info("base_plan: deduped frontier %d → %d plans",
+                   len(_keep), len(frontier))
+    except Exception as e:
+        logger.error("base_plan: optimization failed: %s", e, exc_info=True)
+        return ToolOutput(text=json.dumps({
+            "success": False,
+            "error": f"优化计算失败: {e}",
+        }, ensure_ascii=False))
+
+    layout_desc = {
+        "243": "243（2贸4制3电）", "333": "333（3贸3制3电）",
+        "252": "252（2贸5制2电）", "153": "153（1贸5制3电）",
+    }.get(layout, layout)
+
+    operators_resolved = optimizer._resolve_operators(operator_box)
+
+    # ── 5. Format ALL plans ─────────────────────────────────────────
+    lines = [
+        f"## 基建排班方案（{len(operator_box)}名干员，{layout_desc}）",
+        "",
+        f"覆盖率 {coverage:.0%}，共 {len(frontier)} 个生产方案：",
+        "",
+    ]
+
+    summaries: list[dict] = []
+
+    for pi, plan in enumerate(frontier):
+        # ── Quick classification ──
+        if plan.daily_orundum > 10:
+            category = "🟡 搓玉"
+        elif plan.daily_lmd > plan.daily_combat_record * 2:
+            category = "💰 龙门币"
+        elif plan.daily_combat_record > plan.daily_lmd * 1.5:
+            category = "📋 作战记录"
+        else:
+            category = "⚖️ 均衡"
+
+        config_parts = []
+        for shift in plan.shifts:
+            for room in shift.rooms:
+                if room.product:
+                    label = _CONFIG_NAMES.get(room.product, room.product)
+                    config_parts.append(f"{_FACILITY_NAMES.get(room.facility, room.facility)}{room.index+1}={label}")
+
+        # ── Compact summary ──
+        plan_lines = [f"### 方案{pi + 1}（{category}）"]
+        plan_lines.append("")
+        plan_lines.append(f"- 日产：合成玉 **{plan.daily_orundum:.0f}** | 龙门币 **{plan.daily_lmd:.0f}** | 作战记录 **{plan.daily_combat_record:.0f}**")
+
+        # Show facility assignments
+        if plan.shifts:
+            plan_lines.append("")
+            for shift in plan.shifts:
+                for room in shift.rooms:
+                    fac = f"{_FACILITY_NAMES.get(room.facility, room.facility)}{room.index+1}"
+                    prod = f" ({room.product})" if room.product else ""
+                    if room.operators:
+                        ops = "、".join(
+                            f"{op.name}" + (f"(E{op.elite})" if getattr(op, 'elite', 0) >= 2 else "")
+                            for op in room.operators
+                        )
+                    elif room.facility in ("power", "dormitory"):
+                        ops = "任意干员（不影响产出）"
+                    else:
+                        ops = "空缺"
+                    plan_lines.append(f"**{fac}{prod}**：{ops}")
+
+        # ── Rotation schedule ──
+        if plan.schedule_mode == "morale_driven" and plan.rest_groups:
+            plan_lines.append("")
+            plan_lines.append(f"**🔄 换班节奏**（心情降到35%以下休息）：")
+            for g in plan.rest_groups:
+                cycle = g.work_duration + g.rest_duration
+                plan_lines.append(
+                    f"  - {chr(65 + g.group_id)}组（{g.facility} {g.product}）："
+                    f"工作 {g.work_duration:.1f}h → 休息 {g.rest_duration:.1f}h → "
+                    f"每 {cycle:.1f}h 换一次"
+                )
+            if plan.work_to_rest_ratio > 0:
+                plan_lines.append(f"  - 工休比 {plan.work_to_rest_ratio:.1f}:1")
+
+        # Sustainability check
+        if depot_stock:
+            from src.intelligence.arknights.base_optimizer import BaseOptimizer as BO
+            bal = BO.check_resource_balance(plan, inventory, depot_stock=depot_stock)
+            gsd = bal.get("gold_stockpile_days")
+            if gsd is not None:
+                plan_lines.append(f"  ↳ 库存可支撑约{gsd:.0f}天")
+            if bal.get("warnings"):
+                plan_lines.append(f"  ↳ ⚠️ {bal['warnings'][0]}")
+            stockpile_days_str = f"{gsd:.0f}" if gsd is not None else None
+        else:
+            plan_lines.append(f"  ↳ 未扫描仓库，无法估算可持续天数")
+            stockpile_days_str = None
+
+        lines.extend(plan_lines)
+        lines.append("")
+
+        summary_entry = {
+            "index": pi + 1,
+            "category": category,
+            "orundum": f"{plan.daily_orundum:.0f}",
+            "lmd": f"{plan.daily_lmd:.0f}",
+            "combat_record": f"{plan.daily_combat_record:.0f}",
+        }
+        if stockpile_days_str:
+            summary_entry["stockpile_days"] = stockpile_days_str
+        summaries.append(summary_entry)
+
+    # ── Quick-reference table ──
+    lines.append("---")
+    lines.append("### 📊 速览")
+    lines.append("")
+    lines.append("| # | 方向 | 合成玉/天 | 龙门币/天 | 作战记录/天 |")
+    lines.append("|---|------|-----------|------------|-------------|")
+    for s in summaries:
+        lines.append(f"| {s['index']} | {s['category']} | {s['orundum']} | {s['lmd']} | {s['combat_record']} |")
+    lines.append("")
+
+    if not depot_stock:
+        lines.append("> ⚠️ 未扫描仓库，库存天数无法评估。说「扫描仓库」即可。")
+
+    plan_text = "\n".join(lines)
+
+    # ── 6. Cache ───────────────────────────────────────────────────
+    BaseScheduler._set_cache({
+        "frontier": frontier,
+        "box": operator_box,
+        "layout_desc": layout_desc,
+        "operators": operators_resolved,
+        "inventory": inventory,
+        "depot_stock": depot_stock,
+    })
+
+    logger.info("base_plan: %d plans generated for %d operators",
+               len(frontier), len(operator_box))
+
+    # ── 7. Auto-notify ──────────────────────────────────────────────
+    # Send a concise summary directly to the user so they see the result
+    summary_lines = [
+        f"🏗️ 基建排班方案（{len(operator_box)}名干员，{layout_desc}，覆盖率{coverage:.0%}）",
+        "",
+        f"共 {len(frontier)} 个方案：",
+    ]
+    for s in summaries:
+        depo_note = f"｜库存约{s.get('stockpile_days', '?')}天" if s.get("stockpile_days") else ""
+        summary_lines.append(f"  {s['category']} — 合成玉{s['orundum']} 龙门币{s['lmd']} 作战记录{s['combat_record']}{depo_note}")
+    if not depot_stock:
+        summary_lines.append("")
+        summary_lines.append("💡 扫仓库后可显示每方案能撑几天")
+
+    _notify_screenshot("\n".join(summary_lines))
+
+    return ToolOutput(text=json.dumps({
+        "success": True,
+        "layout": layout_desc,
+        "operator_count": len(operator_box),
+        "plan_count": len(frontier),
+        "has_depot": depot_stock is not None,
+        "message": plan_text,
+    }, ensure_ascii=False))
+
+
+def _load_depot_stock(cache: dict | None):
+    """Load depot stock from cache or latest session. Returns None if unavailable."""
+    if cache and cache.get("depot_stock"):
+        return cache["depot_stock"]
+    try:
+        from src.intelligence.arknights.base_chain import SESSION_DIR
+        if SESSION_DIR.exists():
+            sessions = sorted(
+                [s for s in SESSION_DIR.iterdir()
+                 if s.is_dir() and (s / "warehouse.json").exists()],
+                key=lambda p: p.stat().st_mtime, reverse=True,
+            )
+            if sessions:
+                wh_data = json.loads((sessions[0] / "warehouse.json").read_text(encoding="utf-8"))
+                from src.games.arknights.operators import MaterialStock
+                logger.info("base_plan: auto-loaded depot from %s", sessions[0].name)
+                return MaterialStock(
+                    items=wh_data.get("items", {}),
+                    lmd=wh_data.get("lmd", 0),
+                    scanned_at=wh_data.get("scanned_at", ""),
+                )
+    except Exception as e:
+        logger.debug("base_plan: no depot data: %s", e)
+    return None
+
+
+registry.register(
+    name="base_plan",
+    game="arknights",
+    description=(
+        "【基建排班方案生成】全自动列出所有可行方案，内置截图通知发送给用户。\n"
+        "🔴 工具已内置截图通知！调用后直接 subtask_done，不要手动排班、不要进基建、不要 notify_with_screen。\n"
+        "前端：有 scan_operator_box() 缓存即可，仓库可选。"
+    ),
+    parameters={
+        "type": "object",
+        "properties": {},
+    },
+    handler=base_plan,
 )

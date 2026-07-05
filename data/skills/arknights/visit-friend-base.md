@@ -1,7 +1,7 @@
 ---
 name: visit-friend-base
 description: "明日方舟访问好友基建收菜"
-tags: [明日方舟, 基建, 好友, 访问, guide]
+tags: [访问好友, 好友, 访问, 线索, 信用]
 game: arknights
 type: guide
 verified: false
