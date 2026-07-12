@@ -66,12 +66,37 @@ def skill_run(name: str) -> ToolOutput:
 
         # Re-inject full Steps + Pitfalls so the LLM has the instructions
         # right in front of it instead of relying on stale system prompt memory.
+        # Also inject as a protected conversation message so the instructions
+        # survive clean_subtask_history — otherwise the LLM forgets everything
+        # as soon as it calls subtask_done after the first step.
         pitfalls = skill.get("pitfalls", [])
         pitfalls_text = "\n".join(f"  - {p}" for p in pitfalls) if pitfalls else "（无）"
+        import threading, re
+        ctx = getattr(threading.current_thread(), '_terra_agent_ctx', None)
+        if ctx is not None:
+            # Compact 1-line hint so the LLM doesn't skim past it.
+            # Long skill bodies get ignored; a single actionable line sticks.
+            _coord = re.search(r'adb_tap_position\(([\d.]+),\s*([\d.]+)\)', body)
+            if name == "annihilation":
+                _hint = ("[系统提示 技能：annihilation] adb_tap_position(0.88,0.23)进终端→页面固定模块里找[合成玉]"
+                         "（没有=已打完subtask_done skip），别滑动轮播找剿灭字！")
+            elif name == "farm-1-7":
+                _hint = ("[系统提示 技能：farm-1-7] 第一步：adb_tap_position(0.88, 0.23)进终端"
+                         " → 右下角「上次作战」→ 不是1-7才去曲谱找 → 代理×6开打")
+            elif _coord:
+                _hint = (f"[系统提示 技能：{name}] 入口坐标=adb_tap_position({_coord.group(1)}, {_coord.group(2)})"
+                         f" — 不要找其他入口，直接用这个坐标！")
+            elif "终端" in body and "右侧面板顶部" in body:
+                _hint = f"[系统提示 技能：{name}] 终端在右侧面板顶部(0.88,0.23)，别找底部导航"
+            else:
+                _first = body.strip().split('\n')[0].strip()
+                _hint = f"[系统提示 技能：{name}] {_first}"
+            ctx.state.add_message("user", _hint)
         return ToolOutput(text=json.dumps({
-            "success": False,
+            "success": "manual",
             "message": (
-                f"技能'{name}'没有坐标（verified=false），无法运行快速链。请手动执行。\n"
+                f"技能'{name}'没有坐标（verified=false），快速链无法自动执行。"
+                f"⚠️ 请按照以下步骤手动操作，不可跳过！\n"
                 f"\n--- {name} 操作步骤 ---\n"
                 f"{body.strip()}\n"
                 f"--- 避坑警告 ---\n"

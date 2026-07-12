@@ -406,6 +406,31 @@ class ScreenInjector:
         from src.tools import screen_cache as _sc2
         detections = _ocr.read_text(screenshot)
         texts = [d["text"] for d in detections]
+
+        # ── Auto-dismiss Arknights quit dialog ──
+        # When a tool or the LLM presses back one too many times on the main
+        # screen, "是否确认退出游戏？" appears.  Dismiss it before the LLM
+        # sees it, so it doesn't waste iterations recovering.
+        if any("退出游戏" in t for t in texts):
+            w, h = screenshot.size
+            logger.info("ScreenInjector: auto-dismissing quit dialog")
+            # Find the X (cancel) button in the dialog
+            x_found = None
+            for d in detections:
+                if d.get("text", "").strip() == "X" and d["center"][1] > h * 0.40:
+                    x_found = d["center"]
+                    break
+            if x_found:
+                _get_adb().shell("input", "tap", str(x_found[0]), str(x_found[1]))
+            else:
+                # Fallback: tap left-center area where cancel/X usually is
+                _get_adb().shell("input", "tap", str(int(w * 0.35)), str(int(h * 0.70)))
+            time.sleep(0.5)
+            screenshot = _get_adb().get_screenshot_image()
+            screen_hash = compute_image_hash(screenshot)
+            detections = _ocr.read_text(screenshot)
+            texts = [d["text"] for d in detections]
+
         self.state.last_ocr_texts = texts
 
         from src.utils.dhash import compute_dhash, dhash_to_hex

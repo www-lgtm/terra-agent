@@ -140,96 +140,58 @@ _SCAN_MATERIALS = ["赤金", "源石碎片"]
 
 
 def scan_depot_tool() -> ToolOutput:
-    """Auto-scan main screen + warehouse with VLM and MAA icon templates.
+    """Scan main screen HUD with VLM: 龙门币 + 合成玉.
 
-    Phase 0: VLM reads 龙门币 / 合成玉 from main screen HUD.
-    Phase 1: Navigates to warehouse, passes MAA icon PNGs to VLM for
-             visual matching → gets position + quantity of each material.
+    Warehouse navigation (template → VLM material matching) is removed —
+    the template matcher is deprecated and the fallback tap position
+    (0.80, 0.95) was landing on the base infrastructure button instead of
+    the warehouse, causing the agent to get lost.
+
+    For material quantities (赤金/固源岩/源石碎片), the LLM can use
+    save_depot_resources() to manually inject values or ask the user.
     """
     from src.device.adb import get_adb
     adb = get_adb()
     t0 = time.monotonic()
 
     lmd = orundum = 0
-    img_main = None
-    w_main = h_main = 0
 
     try:
         img_main = adb.get_screenshot_image()
-        w_main, h_main = img_main.size
     except Exception as e:
         logger.warning("scan_depot: main screenshot failed: %s", e)
+        return ToolOutput(text=json.dumps({
+            "success": False,
+            "lmd": 0, "orundum": 0,
+            "message": f"截图失败: {e}",
+        }, ensure_ascii=False))
 
-    if img_main is not None:
-        try:
-            from src.vision.vlm import vlm_descriptor
-            nums = vlm_descriptor.read_numbers(img_main)
-            lmd = int(nums.get("龙门币", "0").replace(",", ""))
-            orundum = int(nums.get("合成玉", "0").replace(",", ""))
-            logger.info("scan_depot: HUD LMD=%d Orundum=%d", lmd, orundum)
-        except Exception as e:
-            logger.warning("scan_depot: VLM HUD failed: %s", e)
+    try:
+        from src.vision.vlm import vlm_descriptor
+        nums = vlm_descriptor.read_numbers(img_main)
+        lmd = int(nums.get("龙门币", "0").replace(",", ""))
+        orundum = int(nums.get("合成玉", "0").replace(",", ""))
+        logger.info("scan_depot: HUD LMD=%d Orundum=%d", lmd, orundum)
+    except Exception as e:
+        logger.warning("scan_depot: VLM HUD failed: %s", e)
 
-    notes: list[str] = []
-    results: dict[str, int] = {}
-
-    if img_main is not None:
-        try:
-            from src.vision.template_match import template_matcher
-            template_matcher.ensure_templates_for_game("arknights")
-            mp = template_matcher.match(img_main, "warehouse", 0.6)
-            if mp:
-                adb.tap(mp["center"][0], mp["center"][1])
-            else:
-                adb.tap(int(w_main * 0.80), int(h_main * 0.95))
-            time.sleep(2.0)
-        except Exception as e:
-            logger.warning("scan_depot: tap failed: %s", e)
-            notes.append(f"进仓库失败: {e}")
-
-        try:
-            img_wh = adb.get_screenshot_image()
-        except Exception as e:
-            logger.warning("scan_depot: warehouse screenshot failed: %s", e)
-            img_wh = None
-
-        if img_wh is not None:
-            from src.vision.vlm import vlm_descriptor
-            for name in _SCAN_MATERIALS:
-                try:
-                    icon = _load_icon_for(name)
-                    r = vlm_descriptor.match_material(img_wh, name, template_image=icon)
-                    if r:
-                        qty = r.get("quantity", 0)
-                        x, y = r["position"]
-                        results[name] = qty
-                        notes.append(f"{name}: {qty}个 (VLM+图标@{x},{y})")
-                    else:
-                        notes.append(f"{name}: 未找到")
-                except Exception as e:
-                    logger.warning("scan_depot: VLM %s failed: %s", name, e)
-                    notes.append(f"{name}: VLM失败({e})")
-
-    puregold = results.get("赤金", 0)
-    orirock = results.get("固源岩", 0)
-    origin_stone = results.get("源石碎片", 0)
-
-    _write_cache(lmd, puregold, orirock, origin_stone, orundum)
+    # Warehouse material scan removed — template matcher is deprecated.
+    # Write 0 for materials to avoid stale cache poisoning; LLM can
+    # call save_depot_resources() to inject real values.
+    _write_cache(lmd, 0, 0, 0, orundum)
 
     elapsed = (time.monotonic() - t0) * 1000
-    detail = "\n".join(f"  {n}" for n in notes) if notes else "  未执行"
     msg = (f"仓库扫描完成 ({elapsed/1000:.0f}s):\n"
            f"  龙门币: {lmd}\n"
-           f"  合成玉: {orundum}\n{detail}\n\n排班缓存已就绪。")
+           f"  合成玉: {orundum}\n"
+           f"  赤金/固源岩/源石碎片: 未扫描（仓库入口模板已废弃）。"
+           f"如需精确库存，从主界面看仓库或用 save_depot_resources 手动注入。")
 
     return ToolOutput(text=json.dumps({
         "success": True,
         "lmd": lmd, "orundum": orundum,
-        "puregold": puregold, "orirock": orirock,
-        "origin_stone": origin_stone,
-        "vlm_notes": notes,
         "elapsed_ms": round(elapsed, 1),
-        "engine": "VLM + MAA icon templates",
+        "engine": "VLM HUD only",
         "message": msg,
     }, ensure_ascii=False, indent=2))
 
@@ -304,13 +266,13 @@ registry.register(
     name="scan_depot",
     check_fn=_maa_icons_available,
     description=(
-        "★★ [仓库关键资源扫描] 一键扫描基建排班所需资源。\n"
-        "VLM 读取主界面龙门币/合成玉 + 用 MAA 官方图标模板在仓库里匹配\n"
-        "赤金、固源岩、源石碎片并读取数量。\n"
-        "结果直接写入排班缓存，扫描完即可进行基建排班。\n"
+        "[HUD资源扫描 — 仅龙门币/合成玉] VLM 读取主界面龙门币和合成玉数量。\n"
+        "⚠️ 不扫描仓库库存（赤金/固源岩/源石碎片），仓库入口模板已废弃。\n"
+        "如需材料库存数据，用 save_depot_resources 手动注入或跳过。\n"
+        "基建排班可以不需要仓库数据直接出方案。\n"
         "\n"
         "【前置条件】必须在明日方舟主界面\n"
-        "【用时】约 10-15 秒"
+        "【用时】约 3-5 秒"
     ),
     handler=scan_depot_tool,
     game="arknights",

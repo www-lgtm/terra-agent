@@ -1474,7 +1474,13 @@ def spawn_background_review(
                                     for name, steps in zip(_seg_names, _segments)
                                 ]
 
-            for sub in sub_chains:
+            # ── Global kill switch: auto-generation produces garbage ──
+            # with bad coordinates (loading screens, misclicks) and garbage
+            # names (base-Operator-仓库.md etc.). Hand-author skills instead.
+            if not config.agent.enable_skill_generation:
+                logger.debug("Skill generation disabled (enable_skill_generation=False)")
+
+            for sub in sub_chains if config.agent.enable_skill_generation else []:
                 steps = sub.get("steps", [])
                 skill_name = sub.get("skill_name", "")
 

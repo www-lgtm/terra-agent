@@ -64,6 +64,31 @@ LAYOUT_PATTERNS: list[tuple[str, str, str]] = [
 ]
 
 
+def _fmt_orundum(v: float) -> str:
+    """Format daily orundum output for display."""
+    if v <= 0:
+        return "—"
+    if v < 100:
+        return f"{v:.0f}/d"
+    return f"{v/1000:.1f}k/d"
+
+
+def _fmt_lmd(v: float) -> str:
+    """Format daily LMD output for display."""
+    if v <= 0:
+        return "—"
+    if v < 10000:
+        return f"{v:.0f}/d"
+    return f"{v/10000:.2f}w/d"
+
+
+def _fmt_cr(v: float) -> str:
+    """Format daily combat record output for display."""
+    if v <= 0:
+        return "—"
+    return f"{v:.1f}/d"
+
+
 class BaseScheduler(IntelligenceTool):
     """Arknights base scheduling optimizer — two-phase interaction:
 
@@ -256,11 +281,10 @@ class BaseScheduler(IntelligenceTool):
             goal_key, goal_desc, _, _ = self._parse_goal(task)
             return IntelligenceResult(
                 recommendation=(
-                    f"检测到基建排班需求（目标：**{goal_desc}**），但系统需要当前账号的最新数据。\n\n"
-                    "请按顺序执行：\n"
-                    "1. **先读仓库** — 调用 scan_depot() 获取赤金/源岩/源石碎片库存\n"
-                    "2. **再扫 Box** — 导航到干员列表 → 排序等级 → 展开职业筛选 → scan_operator_box()\n"
-                    "3. 两个都完成后系统会自动计算最优排班方案\n\n"
+                    f"检测到基建排班需求（目标：**{goal_desc}**），但系统需要当前账号的干员数据。\n\n"
+                    "请执行：\n"
+                    "1. **扫 Box** — 导航到干员列表 → 排序等级 → 展开职业筛选 → scan_operator_box()\n"
+                    "2. 扫描完成后系统会自动计算最优排班方案\n\n"
                     "⛔ 不要直接调 base_shift_maa——那不是用来排班的，是换班用的。"
                 ),
                 confidence=0.9,
@@ -301,33 +325,9 @@ class BaseScheduler(IntelligenceTool):
             depot_stock = (BaseScheduler._get_cache() or {}).get("depot_stock")
 
             # ── Auto-load depot stock from latest chain session ──
-            # When the user hasn't explicitly scanned their warehouse, try
-            # loading from a previous session's scan result.  This lets the
-            # scheduler use real inventory data even on first use.
-            from src.intelligence.arknights.base_chain import SESSION_DIR
-            if depot_stock is None and SESSION_DIR.exists():
-                sessions = sorted(
-                    [s for s in SESSION_DIR.iterdir()
-                     if s.is_dir() and (s / "warehouse.json").exists()],
-                    key=lambda p: p.stat().st_mtime, reverse=True,
-                )
-                if sessions:
-                    try:
-                        import json
-                        wh_path = sessions[0] / "warehouse.json"
-                        wh_data = json.loads(wh_path.read_text(encoding="utf-8"))
-                        from src.games.arknights.operators import MaterialStock
-                        depot_stock = MaterialStock(
-                            items=wh_data.get("items", {}),
-                            lmd=wh_data.get("lmd", 0),
-                            scanned_at=wh_data.get("scanned_at", ""),
-                        )
-                        logger.info(
-                            "Auto-loaded depot stock from %s: %d items, LMD=%d",
-                            sessions[0].name, len(depot_stock.items), depot_stock.lmd,
-                        )
-                    except Exception as e:
-                        logger.debug("Could not auto-load depot stock: %s", e)
+            from src.intelligence.arknights.base_chain import load_depot_stock_from_session
+            if depot_stock is None:
+                depot_stock = load_depot_stock_from_session()
 
             # ── Inventory-aware weight adjustment ──
             # Adjust goal weights based on warehouse stock so the recommended
@@ -409,6 +409,7 @@ class BaseScheduler(IntelligenceTool):
             "box": operator_box,
             "goal_desc": goal_desc,
             "goal_key": goal_key,
+            "layout": layout,
             "layout_desc": layout_desc,
             "operators": operators_resolved,
             "inventory": inventory,
@@ -423,27 +424,14 @@ class BaseScheduler(IntelligenceTool):
             if not bal["warnings"]:
                 _feasible.append((fi, s))
 
-        # ── Depot scan blocker ──────────────────────────────────────
-        # When there is no warehouse data, ALL plan suggestions are blind
-        # guesses.  Return ONLY the blocker — NO comparison table, NO plan
-        # details, NO schedule.  If the LLM sees plan data it will try to
-        # be "helpful" and recommend one instead of scanning.
+        # ── Depot scan note ──────────────────────────────────────
+        # When there is no warehouse data, we can't compute sustainability
+        # (stockpile days).  Still produce the plans — the LLM will note
+        # the gap instead of blocking the user.
         if depot_stock is None:
             logger.info(
                 "BaseScheduler: depot_stock missing — "
-                "returning depot blocker (no resource data)"
-            )
-            return IntelligenceResult(
-                recommendation=(
-                    "## 🛑 缺少仓库数据，无法精准排班\n\n"
-                    f"已加载 {len(operator_box)} 名干员，但**没有仓库库存数据**"
-                    "（龙门币、赤金、固源岩数量未知）。\n\n"
-                    "### 现在必须做这件事，不要做其他任何事：\n\n"
-                    "**调用 `scan_depot()` 一键扫描仓库资源。**\n\n"
-                    "不要 ask_user。不要分析方案。不要给建议。先 scan_depot。"
-                ),
-                confidence=0.60,
-                source="knowledge",
+                "plans will lack sustainability analysis"
             )
 
         # ── Phase 1 output: comparison table + best-plan detail ──
@@ -499,18 +487,6 @@ class BaseScheduler(IntelligenceTool):
                 plan_index_map[display_i] = fi
                 if s is rec_plan:
                     rec_display_num = display_num
-
-                def _fmt_orundum(v: float) -> str:
-                    if v <= 0: return "—"
-                    if v < 100: return f"{v:.0f}/d"
-                    return f"{v/1000:.1f}k/d"
-                def _fmt_lmd(v: float) -> str:
-                    if v <= 0: return "—"
-                    if v < 10000: return f"{v:.0f}/d"
-                    return f"{v/10000:.2f}w/d"
-                def _fmt_cr(v: float) -> str:
-                    if v <= 0: return "—"
-                    return f"{v:.1f}/d"
 
                 config_str = self._short_config(s.config)
                 team_lines = self._summarize_teams(s)
@@ -605,14 +581,6 @@ class BaseScheduler(IntelligenceTool):
             plan_options = []
             for fi, s in _feasible[:8]:
                 config_str = self._short_config(s.config)
-                def _fmt_orundum(v: float) -> str:
-                    if v <= 0: return "—"
-                    if v < 100: return f"{v:.0f}/d"
-                    return f"{v/1000:.1f}k/d"
-                def _fmt_lmd(v: float) -> str:
-                    if v <= 0: return "—"
-                    if v < 10000: return f"{v:.0f}/d"
-                    return f"{v/10000:.2f}w/d"
                 plan_options.append(
                     f"方案#{fi+1} | ⚙{config_str} | "
                     f"合成玉{_fmt_orundum(s.daily_orundum)} "
@@ -1019,19 +987,6 @@ class BaseScheduler(IntelligenceTool):
 
             # Combine chain icon with stock note
             full_chain = chain_icon + stock_note
-
-            # Format daily output with readable units
-            def _fmt_orundum(v: float) -> str:
-                if v <= 0: return "—"
-                if v < 100: return f"~{v:.0f}"
-                return f"~{v/1000:.1f}k"
-            def _fmt_lmd(v: float) -> str:
-                if v <= 0: return "—"
-                if v < 10000: return f"~{v:.0f}"
-                return f"~{v/10000:.2f}w"
-            def _fmt_cr(v: float) -> str:
-                if v <= 0: return "—"
-                return f"~{v:.1f}"
 
             lines.append(
                 f"| {marker} | {_fmt_orundum(s.daily_orundum)} | "

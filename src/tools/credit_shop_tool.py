@@ -53,6 +53,16 @@ _OUT_OF_STOCK_MARKERS = ("OUTOFST", "OFSTOCK")
 _CONFIRM_KW = ("确认", "购买物品", "购买", "确定", "是", "花费", "CONFIRM", "BUY")
 _POPUP_KW = ("获得物品", "获得", "GET", "ITEM")
 
+# Known overlay popup keywords — dialogs that may cover the shop grid.
+# These are NOT the "获得物品" reward popups; they're friend-score,
+# annihilation-score, season-settlement type overlays that appear when
+# entering the credit shop screen.
+# NOTE: "好友" alone is NOT here — it's on the main screen bottom bar
+# and would false-fire after backing out of the shop.  Use only keywords
+# that are UNIQUE to overlay popups, not common UI text.
+_OVERLAY_POPUP_KW = ("剿灭", "排名", "赛季",
+                      "FRIEND", "ANNIHILATION", "SCORE", "RANK")
+
 # Timing
 _CLICK_DELAY = 0.5
 _POPUP_POLL_INTERVAL = 0.3
@@ -81,6 +91,27 @@ def _notify_screenshot(message: str) -> None:
         logger.info("credit_shop: notify sent — %s", message[:120])
     except Exception:
         logger.warning("credit_shop: notify failed (non-critical)", exc_info=True)
+
+
+def _back_to_main(adb, w: int, h: int) -> None:
+    """Press back until the main screen is reached, handling exit dialogs."""
+    _MAIN_SCREEN_KW = ("公开招募", "基建", "Terminal", "档案", "任务", "编队")
+    _EXIT_DIALOG_KW = ("退出游戏", "确认退出")
+    for _back_step in range(4):
+        _back_dets = ocr_engine.read_text(adb.get_screenshot_image())
+        _back_texts = " ".join(d["text"] for d in _back_dets)
+        if any(kw in _back_texts for kw in _EXIT_DIALOG_KW):
+            logger.warning("credit_shop: hit exit dialog, cancelling")
+            _find_and_tap(adb, "取消", w, h)
+            time.sleep(0.4)
+            break
+        if any(kw in _back_texts for kw in _MAIN_SCREEN_KW):
+            logger.info("credit_shop: back to main screen confirmed (step %d)", _back_step)
+            break
+        adb.press_back()
+        time.sleep(0.5)
+    else:
+        logger.warning("credit_shop: could not confirm return to main screen")
 
 
 def _wait_for_screen_change(adb, pre_dhash, timeout: float = 3.0) -> bool:
@@ -281,10 +312,15 @@ def _scan_items(adb, w: int, h: int) -> list[dict]:
             name = name_chinese or name
 
             if name and price:
-                # Click target: center of column, average Y of the band
-                band_ys = [d["center"][1] for d in band_dets]
-                click_y = sum(band_ys) // len(band_ys)
+                # Click target: center of column, fixed row Y.
+                # OCR text positions are unreliable (English subtitles like
+                # "EXPEDITED PLAN" skew the average Y away from the icon).
+                # The shop is a rigid 5×2 grid — tap the icon area directly.
                 click_x = (x_min + x_max) // 2
+                if band_name == "upper":
+                    click_y = int(h * 0.33)
+                else:
+                    click_y = int(h * 0.72)
 
                 items.append({
                     "name": name,
@@ -359,25 +395,69 @@ def credit_shop() -> ToolOutput:
 
     # ── Step 3.5: Ensure shop grid is visible ──────────────────────────
     # Normal credit shop has 40-55 OCR texts in the item area.  If we see
-    # far fewer, a popup/dialog is blocking the view — press back and retry.
+    # far fewer, or known overlay popup keywords, a popup/dialog is blocking
+    # the view — press back and retry.
+    #
+    # Guards to prevent backing all the way out of the shop:
+    #   A) Before each back, verify we're still in the shop (信用/可露希尔/
+    #      交易所 visible).  If not, stop — we've already left.
+    #   B) Check dHash between backs — if the screen didn't change, back is
+    #      not helping, stop.
     _grid_y_top = int(h * 0.20)
     _grid_y_bot = int(h * 0.90)
+    _SHOP_PRESENT_KW = ("信用", "可露希尔", "交易所", "CREDIT")
+    _last_back_hash: str | None = None
     for _attempt in range(4):
         dets = ocr_engine.read_text(adb.get_screenshot_image())
+        texts = " ".join(d["text"] for d in dets)
+        cur_hash = compute_dhash(adb.get_screenshot_image())
+
+        # No overlay detected + enough OCR → grid is clear
         area_count = sum(1 for d in dets
                         if _grid_y_top <= d["center"][1] <= _grid_y_bot)
         total = len(dets)
         if total >= 20 and area_count >= 15:
+            _last_back_hash = None
             break
+
+        # ── Guard A: still in the shop? ──
+        if not any(kw in texts for kw in _SHOP_PRESENT_KW):
+            logger.warning(
+                "credit_shop: shop presence lost (attempt %d) — "
+                "backed out of the shop, stopping", _attempt + 1,
+            )
+            _last_back_hash = None
+            break
+
+        # ── Determine if back is needed ──
+        has_overlay = any(kw in texts for kw in _OVERLAY_POPUP_KW)
+        is_low_ocr = total < 20 or area_count < 15
+        if not has_overlay and not is_low_ocr:
+            _last_back_hash = None
+            break
+
+        # ── Guard B: did last back change the screen? ──
+        if _last_back_hash and hamming_distance(_last_back_hash, cur_hash) < _DHASH_THRESHOLD:
+            logger.warning(
+                "credit_shop: back didn't change screen (attempt %d) — stopping",
+                _attempt + 1,
+            )
+            _last_back_hash = None
+            break
+
+        reason = "overlay" if has_overlay else "low OCR"
         logger.info(
-            "credit_shop: low OCR (total=%d area=%d, attempt %d) — "
-            "popup likely blocking grid, pressing back",
-            total, area_count, _attempt + 1,
+            "credit_shop: %s (total=%d area=%d, attempt %d) — pressing back",
+            reason, total, area_count, _attempt + 1,
         )
         adb.press_back()
+        _last_back_hash = cur_hash
         time.sleep(0.5)
     else:
         logger.warning("credit_shop: grid still obstructed after 4 attempts")
+        _notify_screenshot("信用商店：弹窗遮挡无法清除")
+        _back_to_main(adb, w, h)
+        return _error("弹窗遮挡信用商店网格，4次返回后仍无法进入")
 
     # ── Step 4: Scan items ───────────────────────────────────────────
     items = _scan_items(adb, w, h)
@@ -388,32 +468,42 @@ def credit_shop() -> ToolOutput:
 
     if not items:
         _notify_screenshot("信用商店：无可购买商品")
-        adb.press_back()
-        time.sleep(0.5)
-        adb.press_back()
-        time.sleep(0.3)
+        _back_to_main(adb, w, h)
         return _ok({"bought": 0, "total": 0, "items": [], "message": "无可购买商品"})
 
     # ── Step 5: Build purchase plan ──────────────────────────────────
     items.sort(key=lambda i: (i["priority"], i["price"]))
 
     # Read budget from the credit counter at the top of the screen.
-    # Format: "信用 123/300" or just a bare number like "200".
+    # Format: "信用 123/300", "186/300", or a bare number near "信用".
     budget = 300  # default
     shop_dets = ocr_engine.read_text(adb.get_screenshot_image())
-    # Look for "信用" or "CREDIT" near the top of the screen
+    # Check if "信用" is present anywhere in the top area — without it
+    # we're likely not on the shop screen and all numbers are suspect.
+    _credit_nearby = any(
+        "信用" in d["text"] for d in shop_dets
+        if d["center"][1] < int(h * 0.20)
+    )
+    # Look for "信用" / "CREDIT" near the top of the screen
     for d in shop_dets:
         if d["center"][1] > int(h * 0.20):
             continue  # Budget is always top-left area
         t = d["text"].strip()
-        # Pattern: "123/300" or "信用 123"
-        m = re.search(r'(\d{2,4})\s*/\s*\d{2,4}', t)
+        # Pattern: "610/300" — denominator is always 300 (credit cap).
+        # Match the numerator even if >300 (daily overcap can push it above).
+        # Dates like "2026/07" won't match because 07 ≠ 300.
+        m = re.search(r'(\d{2,4})\s*/\s*(\d{2,4})', t)
         if m:
-            budget = int(m.group(1))
-            logger.info("credit_shop: budget=%d from text '%s'", budget, t)
-            break
-    if budget == 300:
-        # Try bare number near the top that looks like a credit count
+            val = int(m.group(1))
+            denom = int(m.group(2))
+            if denom == 300 and 0 < val <= 800:
+                budget = val
+                logger.info("credit_shop: budget=%d from text '%s'", budget, t)
+                break
+    if budget == 300 and _credit_nearby:
+        # Try bare number near the top that looks like a credit count.
+        # Only trust this if "信用" is nearby — otherwise it could be
+        # a time, date, or other number.
         for d in shop_dets:
             if d["center"][1] > int(h * 0.12):
                 continue
@@ -441,10 +531,10 @@ def credit_shop() -> ToolOutput:
     if not plan:
         item_list = ", ".join(f"{i['name']}({i['price']})" for i in items)
         _notify_screenshot(f"信用商店：余额不足（信用{budget}），有{len(items)}件商品：{item_list}")
-        adb.press_back()
-        time.sleep(0.5)
-        adb.press_back()
-        time.sleep(0.3)
+        # Use the same validated back-to-main loop instead of hardcoded
+        # back presses — avoids triggering the quit dialog by pressing
+        # back too quickly or one too many times.
+        _back_to_main(adb, w, h)
         return _ok({
             "bought": 0, "total": len(items), "items": items,
             "message": f"信用不足，余额{budget}",
@@ -458,38 +548,76 @@ def credit_shop() -> ToolOutput:
         cx, cy = item["click"]
         logger.info("credit_shop: buying '%s' (%d credits) at (%d,%d)", name, price, cx, cy)
 
-        adb.shell("input", "tap", str(cx), str(cy))
+        # ── Tap the item and verify screen changed ──
+        # If screen doesn't change, the tap missed the item icon.
+        # Retry with adjusted Y before giving up.
+        confirmed = False
+        for tap_attempt in range(3):
+            if tap_attempt > 0:
+                # Shift Y slightly — try 20px higher first, then 20px lower
+                offset = -20 if tap_attempt == 1 else 20
+                logger.info("credit_shop: retry tap '%s' at (%d,%d) [attempt %d]",
+                           name, cx, cy + offset, tap_attempt + 1)
+                adb.shell("input", "tap", str(cx), str(cy + offset))
+            else:
+                adb.shell("input", "tap", str(cx), str(cy))
 
-        # Wait for confirmation dialog
-        if _wait_for_text(adb, _CONFIRM_KW, timeout=3.0):
-            # Tap the confirm button — try OCR first, then fixed position
-            tapped = False
-            for kw in _CONFIRM_KW:
-                if _find_and_tap(adb, kw, w, h):
-                    tapped = True
-                    break
-            if not tapped:
-                # Fallback: tap bottom-right of dialog (~common confirm button area)
-                logger.warning("credit_shop: confirm button not found via OCR, using fixed position")
-                adb.shell("input", "tap", str(int(w * 0.80)), str(int(h * 0.82)))
-            time.sleep(0.3)
+            # Wait for confirmation dialog
+            if _wait_for_text(adb, _CONFIRM_KW, timeout=3.0):
+                confirmed = True
+                break
 
-            # Wait for reward popup and dismiss
-            _wait_for_text(adb, _POPUP_KW, timeout=3.0)
-            time.sleep(0.3)
+            # No confirm — check if screen even changed (tap might have missed)
+            # If we can detect the screen changed but confirm didn't appear,
+            # the dialog might use unexpected text — try tapping common confirm
+            # positions anyway.
+            logger.info("credit_shop: no confirm dialog on attempt %d for '%s'",
+                       tap_attempt + 1, name)
+
+        if not confirmed:
+            logger.warning("credit_shop: SKIP '%s' — confirm dialog never appeared", name)
+            # Press back in case we're on a partial dialog screen
             adb.press_back()
             time.sleep(0.3)
-        else:
-            # No confirm dialog — maybe purchase failed, or dialog is different
-            logger.warning("credit_shop: no confirm dialog for '%s', checking popup", name)
-            if _wait_for_text(adb, _POPUP_KW, timeout=1.0):
-                _wait_for_text_gone(adb, _POPUP_KW, timeout=3.0)
-            adb.press_back()
+            continue
+
+        # ── Tap the confirm button ──
+        tapped = False
+        for kw in _CONFIRM_KW:
+            if _find_and_tap(adb, kw, w, h):
+                tapped = True
+                break
+        if not tapped:
+            # Fallback: tap bottom-right of dialog (~common confirm button area)
+            logger.warning("credit_shop: confirm button not found via OCR, using fixed position")
+            adb.shell("input", "tap", str(int(w * 0.80)), str(int(h * 0.82)))
+        time.sleep(0.3)
+
+        # ── Wait for reward popup and dismiss ──
+        _wait_for_text(adb, _POPUP_KW, timeout=3.0)
+        time.sleep(0.3)
+        adb.press_back()
+        time.sleep(0.3)
+        # Verify popup is gone — some "获得物品" popups need a tap,
+        # not back.  If back didn't work, try tapping the screen.
+        if _wait_for_text(adb, _POPUP_KW, timeout=1.0):
+            logger.info("credit_shop: back didn't close popup, trying tap")
+            adb.shell("input", "tap", str(int(w * 0.50)), str(int(h * 0.80)))
             time.sleep(0.3)
+            _wait_for_text_gone(adb, _POPUP_KW, timeout=2.0)
+
+        # ── Verify we're back on the shop screen ──
+        # After dismissing a popup we should see the credit shop grid again.
+        # If budget/credit text is not visible, something went wrong.
+        _post_dets = ocr_engine.read_text(adb.get_screenshot_image())
+        _post_texts = " ".join(d["text"] for d in _post_dets)
+        if not any(kw in _post_texts for kw in ("信用", "CREDIT", "可露希尔")):
+            logger.warning("credit_shop: not on shop screen after buying '%s', pressing back", name)
+            adb.press_back()
+            time.sleep(0.5)
 
         bought.append(item)
         logger.info("credit_shop: bought '%s' ✓", name)
-        time.sleep(0.3)
 
     # ── Step 7: Screenshot + notify ──────────────────────────────────
     summary = ", ".join(f"{i['name']}({i['price']})" for i in bought)
@@ -499,26 +627,7 @@ def credit_shop() -> ToolOutput:
     )
 
     # ── Step 8: Return to main screen ────────────────────────────────
-    # Press back until we see main screen keywords, but stop and cancel
-    # if we accidentally trigger the exit-game dialog.
-    _MAIN_SCREEN_KW = ("采购中心", "基建", "Terminal", "档案", "任务", "编队")
-    _EXIT_DIALOG_KW = ("退出游戏", "确认退出")
-    for _back_step in range(4):
-        _back_dets = ocr_engine.read_text(adb.get_screenshot_image())
-        _back_texts = " ".join(d["text"] for d in _back_dets)
-        if any(kw in _back_texts for kw in _EXIT_DIALOG_KW):
-            logger.warning("credit_shop: hit exit dialog, cancelling")
-            _find_and_tap(adb, "取消", w, h)
-            time.sleep(0.4)
-            # Now we should be on main screen
-            break
-        if any(kw in _back_texts for kw in _MAIN_SCREEN_KW):
-            logger.info("credit_shop: back to main screen confirmed (step %d)", _back_step)
-            break
-        adb.press_back()
-        time.sleep(0.5)
-    else:
-        logger.warning("credit_shop: could not confirm return to main screen")
+    _back_to_main(adb, w, h)
 
     logger.info("credit_shop: done — %d/%d items bought", len(bought), len(plan))
 

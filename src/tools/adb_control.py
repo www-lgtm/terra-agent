@@ -1268,88 +1268,6 @@ def adb_tap_smart(
     return ToolOutput(text=json.dumps(result, ensure_ascii=False))
 
 
-def dismiss_all_popups(max_dismissals: int = 10) -> ToolOutput:
-    """Dismiss all popups by repeatedly pressing back until the screen stabilizes.
-
-    Uses dHash comparison to detect when each popup closes and the screen
-    transitions to either the next popup or the underlying game UI.
-
-    Args:
-        max_dismissals: Maximum number of popups to dismiss (safety cap).
-                        Default 10 is safe — games rarely show more than 10
-                        stacked popups on login.
-
-    Returns how many popups were dismissed and the final screen state.
-    """
-    from src.utils.dhash import compute_dhash, dhash_to_hex, hamming_distance
-
-    adb = get_adb()
-    dismissed = 0
-    no_change_streak = 0
-
-    for i in range(max_dismissals):
-        # Capture current screen
-        img = adb.get_screenshot_image()
-        pre_dhash = dhash_to_hex(compute_dhash(img))
-
-        # Press back
-        _random_delay()
-        adb.press_back()
-        time.sleep(0.6)  # Wait for popup close animation
-
-        # Capture new screen
-        img2 = adb.get_screenshot_image()
-        post_dhash = dhash_to_hex(compute_dhash(img2))
-
-        try:
-            dist = hamming_distance(
-                int(pre_dhash, 16) if isinstance(pre_dhash, str) else pre_dhash,
-                int(post_dhash, 16) if isinstance(post_dhash, str) else post_dhash,
-            )
-        except Exception:
-            dist = 0
-
-        if dist >= 13:
-            # Screen changed significantly — popup was dismissed
-            dismissed += 1
-            no_change_streak = 0
-            logger.info(
-                "dismiss_all_popups: #%d dismissed (dHash dist=%d)",
-                dismissed, dist,
-            )
-            continue
-        elif dist <= 10:
-            # Screen barely changed — popup didn't respond to back
-            no_change_streak += 1
-            if no_change_streak >= 2:
-                # Try tapping center of screen (some popups need a tap, not back)
-                if no_change_streak == 2:
-                    w, h = adb.get_screen_size()
-                    adb.tap(w // 2, h // 2)
-                    time.sleep(0.6)
-                elif no_change_streak >= 3:
-                    logger.info(
-                        "dismiss_all_popups: screen stable after %d dismissals, "
-                        "streak=%d — stopping",
-                        dismissed, no_change_streak,
-                    )
-                    break
-        else:
-            # Intermediate change (11-12) — popup partially dismissed
-            dismissed += 1
-            no_change_streak = 0
-
-    return ToolOutput(text=json.dumps({
-        "success": True,
-        "dismissed": dismissed,
-        "message": (
-            f"关闭了 {dismissed} 个弹窗。"
-            if dismissed > 0
-            else "没有检测到弹窗，或弹窗不需要关闭。"
-        ),
-    }, ensure_ascii=False))
-
-
 def adb_back() -> ToolOutput:
     """Press the Android back button. Includes screen-change detection."""
     adb = get_adb()
@@ -1498,28 +1416,6 @@ registry.register(
         "required": ["target"],
     },
     handler=adb_tap_smart,
-    check_fn=_adb_available,
-)
-
-registry.register(
-    name="dismiss_all_popups",
-    description=(
-        "[推荐用于弹窗风暴] 自动连续按返回键关闭所有弹窗，直到画面稳定。\n"
-        "使用时机：进入游戏后面对多个叠加弹窗（活动公告、充值活动、礼包推广等），"
-        "不需要每个弹窗单独调用 adb_back。一次调用处理所有弹窗。\n"
-        "工作原理：反复按返回键，用 dHash 检测每个弹窗是否已关闭（画面变化 > 阈值 → 弹窗关闭 → 继续下一个）。\n"
-        "连续3次画面无变化 → 自动停止（已到底层UI或所有弹窗已清除）。\n"
-        "安全上限：最多关闭10个弹窗。\n"
-        "返回：关闭了多少个弹窗。\n"
-        "不要使用：只有一个已知弹窗 → 直接用 adb_back。弹窗需要特殊交互而非返回键关闭 → 用其他方法。"
-    ),
-    parameters={
-        "type": "object",
-        "properties": {
-            "max_dismissals": {"type": "integer", "description": "最多关闭几个弹窗（默认10，安全上限）。"},
-        },
-    },
-    handler=dismiss_all_popups,
     check_fn=_adb_available,
 )
 

@@ -48,6 +48,9 @@ _LOADING_SCREEN_KW: frozenset[str] = frozenset({
     # Arknights-specific loading screens
     "infrastructure",  # RHODES ISLAND INFRASTRUCTURE COMPLEX
     "进驻",  # 设施进驻说明, loading tip text
+    # Arknights server communication — transition screen, NOT a popup.
+    # Pressing back here triggers the quit-game dialog.
+    "正在提交反馈至神经", "提交反馈", "神经",
 })
 
 
@@ -101,6 +104,11 @@ _BACK_LEGITIMATE_KW: frozenset[str] = frozenset({
     "返回", "后退", "退回", "回退", "退出", "go back", "press back",
     "按返回", "按了返回", "误按了返回", "误按返回",
     "不小心按了返回", "pressed back", "pressing back",
+    # Popup/preview dismissal — LLM correctly uses back to close overlays
+    "关闭弹窗", "关掉弹窗", "关闭这个", "关掉这个",
+    "关闭预览", "关掉预览", "预览弹窗", "掉落预览",
+    "用返回", "用adb_back", "试adb_back", "再adb_back",
+    "back关闭", "back关掉", "再返回", "再按返回",
 })
 
 # ── Resource consumption guard constants (module level) ──────────────
@@ -338,9 +346,7 @@ class TerraAgent:
         # ── Repeated-thinking detection ──
         self._last_think_bigrams: set[str] = set()   # Chinese bigrams from previous LLM text
         self._repeat_think_streak: int = 0            # Consecutive near-identical thinking rounds
-        self._subtask_iter: dict[str, int] = {}       # Per-subtask iteration counter
-        self._subtask_iter_warned: set[str] = set()   # Subtasks that already got the 40-iter warning
-        self._last_skill_run: str = ""                # Most recent skill_run name (for subtask tracking)
+        self._last_skill_run: str = ""                # Most recent skill_run name
         self._verify_step: str = ""                 # Orchestrator verify step name (e.g. "daily-reward-check")
         self._last_memory_hint = ""
         self._last_user_hint = ""
@@ -1297,73 +1303,19 @@ class TerraAgent:
                 self.state._interrupt_event.clear()
                 continue
 
-            # ── Periodic activity heartbeat ──
-            # If the agent has been doing something (not waiting for user) but
-            # hasn't produced visible output in 45s, send a heartbeat so the
-            # user knows it's alive (multi-agent responsiveness).
-            if (not self.state._waiting_for_user
-                    and self._last_activity > 0
-                    and time.monotonic() - self._last_activity > 45):
-                self._heartbeat(
-                    f"工作中（{self.state.current_activity or '思考中'}）"
-                )
+            # ── Periodic activity heartbeat (REMOVED) ──
+            # The "工作中（credit_shop({})）" heartbeat was firing during
+            # normal long-running tool execution (credit_shop=86s, recruit=210s),
+            # producing pointless noise.  The wait-for-user heartbeat above
+            # (every 180s) is sufficient for multi-agent responsiveness.
 
             self.state.iteration_count += 1
 
-            # ── Subtask iteration timeout ──
-            # Individual subtasks should complete within 30-40 iterations.
-            # If one subtask hogs > 40 iterations, inject a warning; at > 60,
-            # auto-force completion to give the remaining subtasks a chance.
-            # Orchestrator-type skills are NEVER tracked — they are the overall
-            # task plan, not an individual subtask that can be "skipped".
-            _completed = self.state.completed_subtasks or set()
-            _skills = self.state.matching_skills or []
-            _current_skill = ""
-            # Prefer the most recently skill_run'd subtask — the agent may
-            # reorder subtasks, and the first uncompleted skill in the list
-            # is not necessarily what the agent is working on right now.
-            _sk_names = {_s["name"] for _s in (_skills or []) if _s.get("type") != "orchestrator"}
-            if self._last_skill_run and self._last_skill_run in _sk_names and self._last_skill_run not in _completed:
-                _current_skill = self._last_skill_run
-            else:
-                for _s in (_skills or []):
-                    if _s["name"] not in _completed and _s.get("type") != "orchestrator":
-                        _current_skill = _s["name"]
-                        break
-            if _current_skill:
-                _sk_iter = self._subtask_iter.get(_current_skill, 0) + 1
-                self._subtask_iter[_current_skill] = _sk_iter
-                _MAX_SUBTASK_ITER = 60
-                _WARN_SUBTASK_ITER = 40
-                if _sk_iter >= _MAX_SUBTASK_ITER:
-                    logger.warning(
-                        "Subtask '%s' exceeded max iterations (%d ≥ %d) — auto-force skipping",
-                        _current_skill, _sk_iter, _MAX_SUBTASK_ITER,
-                    )
-                    self.state.add_message("user",
-                        f"[系统 — 子任务超时] 子任务 '{_current_skill}' 已消耗 {_sk_iter} 轮迭代"
-                        f"（上限 {_MAX_SUBTASK_ITER}），自动跳过。"
-                        f"请立即调用 subtask_done('{_current_skill}', 'auto-timeout') "
-                        f"并继续下一个子任务。")
-                    del self._subtask_iter[_current_skill]
-                    self._subtask_iter_warned.discard(_current_skill)
-                elif _sk_iter >= _WARN_SUBTASK_ITER and _current_skill not in self._subtask_iter_warned:
-                    logger.warning(
-                        "Subtask '%s' approaching iteration limit (%d ≥ %d) — injecting warning",
-                        _current_skill, _sk_iter, _WARN_SUBTASK_ITER,
-                    )
-                    _remaining_skills = [_s["name"] for _s in _skills
-                                         if _s["name"] not in _completed and _s["name"] != _current_skill]
-                    _msg = (f"[系统提示] 子任务 '{_current_skill}' 已消耗 {_sk_iter} 轮迭代，"
-                            f"超过预期（≤{_WARN_SUBTASK_ITER}轮）。")
-                    if _remaining_skills:
-                        _msg += (f" 还有 {len(_remaining_skills)} 个子任务在排队："
-                                f"{', '.join(_remaining_skills[:4])}。")
-                    _msg += (f" 如果卡住了：1) 检查这是否是已知的困难操作（如图形按钮'挑战>>'）；"
-                            f"2) 考虑调用 subtask_done('{_current_skill}', 'auto-skip') 跳过；"
-                            f"3) 或换一种方式（adb_tap_position 猜坐标 / 返回键重来）。")
-                    self.state.add_message("user", _msg)
-                    self._subtask_iter_warned.add(_current_skill)
+            # ── Subtask iteration tracking (REMOVED) ──
+            # Previously injected warnings at 40 iter and force-skipped at
+            # 60 iter.  Removed because: completing the task is the ONLY
+            # priority.  farm-1-7 draining 600+ sanity needs 80+ iterations
+            # and that's normal.  Don't scare the LLM into giving up early.
 
             # Check for Concierge-requested cancellation (safe zone only)
             if self.state._pending_cancel and self.state.interrupt_zone == "safe":
@@ -1525,14 +1477,14 @@ class TerraAgent:
                     f" 你负责 **{game_name}**，设备 {self.state.device_serial}。"
                     f"如果不是这个游戏界面 → 先退回到桌面再启动 {game_name}。\n"
                     f"当前时间: {_fmt_time_now()}。\n"
-                    f"## 你必须完成的全部子任务及执行细节:\n\n{skill_detail}"
+                    f"## 匹配技能及执行细节（仅执行与用户请求相关的）:\n\n{skill_detail}"
                     f"{stale_warning}\n\n"
                     "逐一回答:\n"
-                    "1. 上面哪些子任务已完成？（标记 ✓）\n"
-                    "2. 哪些还没做？\n"
-                    "3. 当前在做什么？是否卡住了？\n"
-                    "4. 下一个最快能完成的是哪个？\n"
-                    "全部子任务确实做完了才调 task_complete。没做完就继续。")
+                    "1. 哪些技能已完成？（标记 ✓）\n"
+                    "2. 哪些技能判断为不相关，已用 user-skip 跳过？（标记 ✗）\n"
+                    "3. 哪些还没做？\n"
+                    "4. 当前在做什么？是否卡住了？\n"
+                    "5. 所有相关任务确实做完了才调 task_complete。不相关的用 subtask_done(name, 'user-skip') 标记跳过。")
 
                 # Dedup: skip re-injecting identical skill detail.
                 # Compression strips the initial system prompt after ~40 messages,
@@ -1637,7 +1589,8 @@ class TerraAgent:
                             f"[系统 — 重复推理检测] 连续 {self._repeat_think_streak} 轮推理内容高度重复"
                             f"（Jaccard={_jaccard:.1%}）且无操作。立即停止重复推理！\n"
                             f"如果当前操作确实无法执行（按钮找不到/页面卡住），"
-                            f"调用 subtask_done('{_force_name}', 'auto-stuck') 跳过。\n"
+                            f"调用 subtask_done('{_force_name}', 'auto-stuck') 跳过。"
+                            f"如果还有相关子任务再继续。\n"
                             f"如果能操作：直接执行一个工具调用——不要多想，直接操作。")
                         self._repeat_think_streak = 0  # Reset to avoid double-injection
                         self._max_tokens_no_tool_streak = 0
@@ -1698,8 +1651,8 @@ class TerraAgent:
                     self.state.add_message("user",
                         f"[系统 — 自动恢复] LLM 输出 {self._last_output_tokens} tokens "
                         f"耗尽 max_tokens 且无工具调用（疑似重复输出）。当前子任务 '{_force_name}' "
-                        f"自动跳过。请立即调用 subtask_done('{_force_name}', 'auto-forced') "
-                        f"并继续下一个子任务。不要回头重试该子任务。")
+                        f"自动跳过。请立即调用 subtask_done('{_force_name}', 'auto-forced')。"
+                        f"不要回头重试该子任务。如果还有相关子任务再继续。")
                     logger.warning(
                         "Output guard: auto-forcing subtask completion for '%s' (streak=%d)",
                         _force_name, self._max_tokens_no_tool_streak)
@@ -1837,8 +1790,8 @@ class TerraAgent:
                             self.state.add_message("user",
                                 f"[系统 — 自动恢复] 画面已连续 {self._no_tool_static_streak} 轮完全静止"
                                 f"且无任何操作。当前子任务 '{_force_name}' 自动标记为完成。"
-                                f"请立即调用 subtask_done('{_force_name}', 'auto-escalated') "
-                                f"然后继续下一个子任务。")
+                                f"请立即调用 subtask_done('{_force_name}', 'auto-escalated')。"
+                                f"如果还有相关子任务再继续。")
                             self._no_tool_static_streak = 0
                             self.loop_guard.idle_streak = 0
                         elapsed_cooldown = 0.0
@@ -1904,13 +1857,14 @@ class TerraAgent:
                             if target and len(target) >= 2 and any(target in ot for ot in _ocr_now):
                                 _targets_on_screen = True
                                 break
-                        # adb_back is never exempt — LLM thinking "wait"
-                        # but pressing back is always contradictory.
-                        # Always discard on first conflict.  Only after
-                        # 3 consecutive conflicts do we let it through.
+                        # adb_back is a safe retreat — allow through after
+                        # just 1 conflict instead of the normal 3.
+                        # LLM saying "卡住了再试adb_back" is a valid recovery.
+                        _is_back_only = len(_conflict_tools) == 1 and _conflict_tools[0] == "adb_back"
+                        _threshold = 1 if _is_back_only else 3
                         if not _targets_on_screen:
                             self._wait_intent_conflict_streak += 1
-                            if self._wait_intent_conflict_streak >= 3:
+                            if self._wait_intent_conflict_streak >= _threshold:
                                 # Before executing anyway, check if the screen is
                                 # genuinely still loading.  If OCR contains loading
                                 # keywords (RHODES ISLAND, INFRASTRUCTURE, etc.),
@@ -1933,7 +1887,7 @@ class TerraAgent:
                                     self._wait_intent_conflict_streak = 0
                                     self.screen_injector.inject_now(fast=True)
                                     continue
-                                # 3 consecutive conflicts + screen is loaded → execute.
+                                # streak + screen is loaded → execute.
                                 logger.warning(
                                     "Wait-intent conflict streak=%d — executing anyway (iter %d)",
                                     self._wait_intent_conflict_streak,
@@ -1942,20 +1896,20 @@ class TerraAgent:
                                 self._wait_intent_conflict_streak = 0
                                 self.state.add_message("user",
                                     "[系统提醒] 当前画面可能正在加载中，"
-                                    "但你已经等待了3轮。先执行操作看看效果吧。")
+                                    f"但你已经等待了{_threshold}轮。先执行操作看看效果吧。")
                                 # Fall through — execute tools
                             else:
                                 logger.warning(
                                     "Wait-intent conflict: thinking says wait but "
-                                    "tool calls are %s (iter %d, streak=%d/3). Discarding response.",
+                                    "tool calls are %s (iter %d, streak=%d/%d). Discarding response.",
                                     _conflict_tools, self.state.iteration_count,
-                                    self._wait_intent_conflict_streak,
+                                    self._wait_intent_conflict_streak, _threshold,
                                 )
                                 self.state.add_message("user",
                                     "[系统 — 检测到矛盾] 你的思考说等待/不操作，但你发出了操作指令。"
                                     "如果确实需要操作（关闭弹窗、跳过对话等）→ 直接做，不要犹豫。"
                                     "如果确实应该等待加载/过渡完成 → 移除操作指令。"
-                                    f"连续 {self._wait_intent_conflict_streak}/3 次矛盾后系统自动放行。")
+                                    f"连续 {self._wait_intent_conflict_streak}/{_threshold} 次矛盾后系统自动放行。")
                                 # Inject fresh screenshot so the next LLM call sees
                                 # the current screen — prevents looping on the same
                                 # stale image + correction message.
@@ -2308,17 +2262,21 @@ class TerraAgent:
                     _min_iters = 20 if len(skills) > 1 else 8
                     _blocked = False
                     if self.state.iteration_count < _min_iters:
-                        # Non-orchestrator skills that still need work
+                        # Non-orchestrator skills that still need work.
+                        # Exclude skills the LLM explicitly skipped as irrelevant.
+                        _skipped = getattr(self.state, 'skipped_subtasks', set())
                         _pending = [
                             s for s in skills
-                            if s.get("type") != "orchestrator" and s["name"] not in _completed
+                            if s.get("type") != "orchestrator"
+                            and s["name"] not in _completed
+                            and s["name"] not in _skipped
                         ]
-                        # Let through if all subtasks already done — deterministic
+                        # Let through if all subtasks already done or skipped — deterministic
                         # tools like credit_shop/base_collect complete in 1 call.
-                        if not _pending and _completed:
+                        if not _pending and (_completed or _skipped):
                             logger.info(
-                                "task_complete early: all %d subtask(s) done at iter=%d — allowing",
-                                len(_completed), self.state.iteration_count,
+                                "task_complete early: %d done + %d skipped at iter=%d — allowing",
+                                len(_completed), len(_skipped), self.state.iteration_count,
                             )
                             # Fall through — don't block
                         elif _pending:
@@ -2328,10 +2286,14 @@ class TerraAgent:
                                     "task_complete BLOCKED: %d skills at iter=%d, pending=%s",
                                     len(skills), self.state.iteration_count, [s["name"] for s in _pending],
                                 )
+                                _skip_hint = (
+                                    " 如果剩余技能与用户请求不相关，"
+                                    "请调用 subtask_done(name, 'user-skip') 跳过，然后再调 task_complete。"
+                                )
                                 self.state.add_message("user",
-                                    f"[系统提示] 匹配了 {len(skills)} 个子任务: {', '.join(skill_names)}。"
+                                    f"[系统提示] 匹配了 {len(skills)} 个技能: {', '.join(skill_names)}。"
                                     f"还有 {len(_pending)} 个未完成，才跑了 {self.state.iteration_count} 轮。"
-                                    f"继续执行剩余任务。全做完后再调 task_complete。")
+                                    f"继续执行相关任务。{_skip_hint}")
                             else:
                                 logger.warning(
                                     "task_complete BLOCKED: single skill at iter=%d, pending=%s",
@@ -2386,6 +2348,24 @@ class TerraAgent:
                                tool_name, output.task_done, output.subtask_done)
                 self._log_tool_result(tool_name, output)
                 self.state.add_tool_result(tc["id"], tool_name, self._build_content(output, tool_name=tc["name"]))
+
+                # ── ask_user handling: enter wait state ──
+                # The main tool loop was missing this — ask_user was dispatched
+                # but needs_user=True was never checked, so the loop just
+                # continued past ask_user and exited unexpectedly.
+                if output.needs_user:
+                    confirmation = self._needs_confirmation(output)
+                    if confirmation:
+                        self.state._ask_user_count += 1
+                        self._notify_with_screen(f"🤔 {confirmation}")
+                        self._wait_cycles = 0
+                        self.state._waiting_for_user = True
+                        reply = self.state.pop_interrupt()
+                        if reply:
+                            self.state.add_message("user", f"[用户回复] {reply}")
+                            self.state._waiting_for_user = False
+                            logger.info("Immediate interrupt reply caught")
+                        break  # Stop tool execution, wait for user at top of loop
 
                 # ── Check task/subtask completion BEFORE all post-processing ──
                 # Post-processing code below (stuck-target, magnify guard, failure
@@ -2605,7 +2585,8 @@ class TerraAgent:
                     self.state.add_message("user",
                         f"[系统 — 强制跳过] 同一目标已连续失败 {self._stuck_count} 次，"
                         f"判定为不可完成。立即调用 subtask_done('{_force_name}', 'auto-stuck') "
-                        f"跳过当前子任务，继续下一个。不要继续尝试该目标！")
+                        f"跳过当前子任务。不要继续尝试该目标！"
+                        f"如果还有相关子任务再继续。")
                     self._stuck_count = 0
                     self._stuck_target = ""
 
@@ -2640,62 +2621,6 @@ class TerraAgent:
                 if tool_name == "restart_emulator" and _tool_success:
                     self.screen_injector._post_restart_extension = 1.5
 
-                # Check for user intervention
-                confirmation = self._needs_confirmation(output)
-                if confirmation:
-                    self.state._ask_user_count += 1
-                    if self.ask_fn:
-                        answer = self.ask_fn(confirmation)
-                        self.state.add_message("user", f"[Guidance] {answer}")
-                    elif self.state.on_notify:
-                        # Async mode — notify user, then wait at top of loop (no LLM burn)
-                        self._notify_with_screen(f"🤔 {confirmation}")
-                        self._wait_cycles = 0
-                        self.state._waiting_for_user = True
-                        # Quick poll: if user replied super fast, grab it now
-                        immediate = self.state.pop_interrupt()
-                        if immediate:
-                            self.state.add_message("user", f"[用户回复] {immediate}")
-                            self.state._waiting_for_user = False
-                            logger.info("Immediate user reply caught")
-                    else:
-                        return {
-                            "success": False,
-                            "needs_input": True,
-                            "question": confirmation,
-                            "iterations": self.state.iteration_count,
-                        }
-                    break  # No more tool execution while waiting for user
-
-            # ── Check for user intervention (ALL tools, not just action tools) ──
-            # ask_user tool returns needs_user=True, but the check above at line
-            # ~2565 only runs for tools in ACTION_TOOLS — ask_user is NOT one.
-            # This catch-all ensures ask_user's notification reaches the user.
-            if output.needs_user:
-                confirmation = self._needs_confirmation(output)
-                if confirmation:
-                    self.state._ask_user_count += 1
-                    if self.ask_fn:
-                        answer = self.ask_fn(confirmation)
-                        self.state.add_message("user", f"[Guidance] {answer}")
-                    elif self.state.on_notify:
-                        self._notify_with_screen(f"🤔 {confirmation}")
-                        self._wait_cycles = 0
-                        self.state._waiting_for_user = True
-                        immediate = self.state.pop_interrupt()
-                        if immediate:
-                            self.state.add_message("user", f"[用户回复] {immediate}")
-                            self.state._waiting_for_user = False
-                            logger.info("Immediate user reply caught")
-                    else:
-                        return {
-                            "success": False,
-                            "needs_input": True,
-                            "question": confirmation,
-                            "iterations": self.state.iteration_count,
-                        }
-                    break  # No more tool execution while waiting for user
-
             # ── Subtask boundary cleanup ──
             # When the agent calls subtask_done(), clean intermediate
             # operations for that subtask from conversation history.
@@ -2711,35 +2636,101 @@ class TerraAgent:
                 )
                 self.state.clean_subtask_history(name, result)
                 self.state.completed_subtasks.add(name)
-                self._subtask_iter.pop(name, None)  # reset iteration counter
-                self._subtask_iter_warned.discard(name)
+                # Track explicitly-skipped skills separately — these are
+                # deliberately not relevant, not "failed to complete."
+                if result and 'skip' in str(result).lower():
+                    if not hasattr(self.state, 'skipped_subtasks'):
+                        self.state.skipped_subtasks = set()
+                    self.state.skipped_subtasks.add(name)
                 self._persist_checkpoint()
 
-                # ── P0: All subtasks done → early exit ──
-                # Avoid burning remaining budget on post-completion wandering.
+                # ── Inject a completion summary so the LLM doesn't forget ──
+                # After every subtask_done, clean_subtask_history wipes most
+                # conversation context.  Without a summary, the LLM forgets
+                # which subtasks it has already completed and starts re-doing
+                # them (especially bad after 3+ completions).
                 _ms = self.state.matching_skills or []
                 _cs = self.state.completed_subtasks or set()
-                if _ms and _cs:
-                    _all_done = all(
-                        s["name"] in _cs for s in _ms
-                        if s.get("type") != "orchestrator"
-                    )
-                    if _all_done:
-                        logger.info(
-                            "All subtasks completed (%d/%d), early exit at iter %d",
-                            len(_cs), len([s for s in _ms if s.get("type") != "orchestrator"]),
-                            self.state.iteration_count,
+                _expected: list[str] = []
+                for s in _ms:
+                    if s.get("type") == "orchestrator":
+                        try:
+                            from src.skills.manager import get_skill_manager
+                            _skm = get_skill_manager(s.get("game", "arknights"))
+                            _full = _skm.load(s["name"])
+                            if _full:
+                                _expected.extend(_full.get("subskills", []))
+                                _verify = _full.get("verify")
+                                if _verify:
+                                    _expected.append(_verify)
+                        except Exception:
+                            pass
+                    else:
+                        _expected.append(s["name"])
+                # Build the Done / Remaining lists
+                _skipped_set = getattr(self.state, 'skipped_subtasks', set())
+                _done_list = [n for n in _expected if n in _cs]
+                _remaining = [n for n in _expected if n not in _cs]
+                _done_str = "、".join(_done_list) if _done_list else "无"
+                _skipped_str = "、".join([n for n in _done_list if n in _skipped_set]) if _skipped_set else ""
+                _remaining_str = "、".join(_remaining) if _remaining else "无"
+                # When verify step (daily-reward-check) is done and rewards
+                # are all claimed, there's no point farming 1-7 or doing other
+                # conditional subtasks.  Auto-complete them so the orchestrator
+                # doesn't force LLM into unnecessary work.
+                if name == "daily-reward-check":
+                    _remaining = [n for n in _remaining
+                                  if n not in ("farm-1-7", "annihilation")]
+                _next_str = _remaining[0] if _remaining else "task_complete"
+                _self_notified = name in ("base-collect", "credit-shop", "recruit")
+                _notify_note = "（截图工具已发送，不要重复 notify_with_screen）" if _self_notified else ""
+                # Compact coordinate hint for guide skills with known fixed entry points.
+                # Prevents LLM from wandering around looking for wrong buttons.
+                _next_hint = ""
+                if _next_str == "annihilation":
+                    _next_hint = " | adb_tap_position(0.88,0.23)→终端→页面固定模块里找「合成玉」入口（没有=已打完skip），别滑动轮播"
+                elif _next_str == "farm-1-7":
+                    _next_hint = " | adb_tap_position(0.88, 0.23)→终端，找右下角「上次作战」快捷入口"
+                elif _next_str == "daily-reward-check":
+                    _next_hint = " | 进任务面板→日常tab(0.15,0.11)→顶栏已领取沉底→「报酬已领取」水印=已领完，别点它"
+                # Orchestrator mode: subskills are genuinely mandatory, keep forced-next.
+                # Non-orchestrator: advisory only — LLM evaluates relevance.
+                _is_orch = any(s.get("type") == "orchestrator" for s in (_ms or []))
+                if _remaining:
+                    if _is_orch:
+                        _next_msg = f"下一步请执行：{_next_str}。"
+                    else:
+                        _next_msg = (
+                            f"如果还有与用户请求相关的子任务，请继续执行。"
+                            f"不相关 → subtask_done(name, 'user-skip') 跳过。"
+                            f"全部处理完 → task_complete()。"
                         )
-                        # Let the loop exit normally — the next guard will
-                        # break when budget.consume() fails or LLM calls
-                        # task_complete.  We just log for visibility.
+                else:
+                    _next_msg = "所有子任务已处理完毕，请调用 task_complete()。"
+                _skip_part = f" 已跳过：{_skipped_str}。" if _skipped_str else ""
+                self.state.add_message("user",
+                    f"[子任务进度] 已完成：{_done_str}。{_skip_part}未完成：{_remaining_str}。"
+                    f"{_next_msg}{_notify_note}{_next_hint}")
+                if not _remaining:
+                    logger.info(
+                        "All subtasks completed (%d/%d), early exit at iter %d",
+                        len(_cs), len(_expected),
+                        self.state.iteration_count,
+                    )
+
                 # Inject the current screen after cleaning so the agent
-                # sees a fresh image immediately (otherwise the screen
-                # injection at line 1792 only fires when
-                # any_action_succeeded and next iteration starts).
-                # Force-screen-inject will happen naturally on the next
-                # iteration — the tail of clean_subtask_history already
-                # contains the latest screen.
+                # sees a fresh image immediately.  Without this, the LLM sees
+                # a stale screenshot from before the tool call and doesn't know
+                # it's already on the main screen — so it presses back, hits
+                # the quit dialog, and wastes iterations recovering.
+                try:
+                    self.screen_injector.inject_now()
+                except Exception:
+                    pass
+
+            # ── Post-tool-loop: if ask_user fired, skip entirely → wait loop ──
+            if self.state._waiting_for_user:
+                continue
 
             # ── Post-tool-loop termination: if _task_completed was set by
             # the per-tool check above, exit immediately.  Belt-and-suspenders
@@ -2965,9 +2956,10 @@ class TerraAgent:
         if len(actionable) > 1:
             names = [s.get("name", "?") for s in actionable]
             parts.append(
-                f"## 待完成子任务 ({len(names)} 个)\n"
+                f"## 匹配技能 ({len(names)} 个)\n"
                 + ", ".join(names)
-                + "\n> 以上全部子任务必须完成才能调用 task_complete。"
+                + "\n> 这些技能与用户请求关键词匹配，请逐个判断是否与用户需求相关。"
+                  "只执行相关的。不相关 → subtask_done(name, 'user-skip') 跳过。"
             )
 
         # Expand ALL guide-type skills so the agent has full instructions for
@@ -3232,7 +3224,7 @@ def _expand_orchestrator_body(skill: dict[str, Any]) -> str:
             lines.append("### 委派工具（调用专用工具一键完成，极快且免费）")
             for sub_name in delegated_subs:
                 lines.append(f"- 🎯 **{sub_name}** — 调用 {sub_name.replace('-', '_')}() 工具")
-            lines.append("> 🔴 每个子技能完成后必须 notify_with_screen 截图，然后 subtask_done。详见执行计划。")
+            lines.append("> 🔴 委派工具已内置截图通知 — 调用后直接 subtask_done，**禁止**再调 notify_with_screen！详见执行计划。")
             lines.append("")
         if verified_subs:
             lines.append("### 已验证子技能（调用 skill_run 一键执行，极快且免费）")
@@ -3404,7 +3396,11 @@ def _format_skill_for_review(skill: dict[str, Any]) -> str:
             verified_count = 0
             for sub_name in subskills:
                 sub = _rv_skm.load(sub_name)
-                if sub and sub.get("verified"):
+                # Check for delegated tool first — tool-backed, no notify_with_screen needed
+                tool_name = sub_name.replace("-", "_")
+                if registry.get(tool_name):
+                    lines.append(f"  - [ ] 🎯 **{sub_name}** — 调用 {tool_name}() 工具（内置通知，直接 subtask_done）")
+                elif sub and sub.get("verified"):
                     lines.append(f"  - [ ] ✅ skill_run('{sub_name}') 一键执行")
                     lines.append(f"        🔴 完成后立即 notify_with_screen 截图 → subtask_done('{sub_name}')")
                     verified_count += 1

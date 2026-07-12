@@ -20,6 +20,7 @@ from src.tools import material_tools  # noqa: F401
 from src.tools import learn  # noqa: F401
 from src.tools import notify_screen  # noqa: F401
 from src.tools import recruit_optimizer  # noqa: F401
+from src.tools import recruit_tool  # noqa: F401
 from src.tools import remember  # noqa: F401
 from src.tools import safety  # noqa: F401
 from src.tools import schedule_tools  # noqa: F401

@@ -52,7 +52,7 @@ _COMMON_STABLE = """## 标记说明
 - **弹窗**：关不掉 → adb_back() → magnify() → tap_magnified() → ask_user()。不要猜百分比坐标。
 - **失败即问**：同一操作 3 种方法都失败 → ask_user()。不确定 → ask_user()。调用后等回复。
 - **资源消耗**：任何消耗游戏内资源的操作必须先 ask_user() 确认。不确定是否消耗 → 问。
-- **多子任务**：每个子任务完成 → subtask_done(name, result)。全部完成 → task_complete()。
+- **多子任务**：系统匹配的技能是参考建议而非强制清单。先判断每个是否与用户请求相关。相关→执行后 subtask_done(name, result)；不相关→ subtask_done(name, 'user-skip') 跳过。全部处理完 → task_complete()。
 - **通信**：需要用户做任何事 → 必须调 ask_user()。纯文本输出用户看不见。
 - **自动战斗**：严禁 notify_with_screen。等操作结束、回到可操作界面后再通知。
 - **记住经验**：同一按钮失败 2+ 次后终于点成功了 → remember() 保存定位方式。

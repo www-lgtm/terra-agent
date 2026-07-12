@@ -33,6 +33,37 @@ logger = logging.getLogger(__name__)
 
 SESSION_DIR = Path(__file__).parent.parent.parent.parent / "data" / "session"
 
+
+def load_depot_stock_from_session(cache: dict | None = None):
+    """Load depot stock from cache or latest session's warehouse.json.
+
+    Returns a MaterialStock if available, otherwise None.
+    Shared by base_plan tool and BaseScheduler to avoid duplicate logic.
+    """
+    if cache and cache.get("depot_stock"):
+        return cache["depot_stock"]
+    try:
+        if SESSION_DIR.exists():
+            sessions = sorted(
+                [s for s in SESSION_DIR.iterdir()
+                 if s.is_dir() and (s / "warehouse.json").exists()],
+                key=lambda p: p.stat().st_mtime, reverse=True,
+            )
+            if sessions:
+                wh_data = json.loads((sessions[0] / "warehouse.json").read_text(encoding="utf-8"))
+                from src.games.arknights.operators import MaterialStock
+                logger.info("Auto-loaded depot stock from %s: %d items, LMD=%d",
+                           sessions[0].name, len(wh_data.get("items", {})), wh_data.get("lmd", 0))
+                return MaterialStock(
+                    items=wh_data.get("items", {}),
+                    lmd=wh_data.get("lmd", 0),
+                    scanned_at=wh_data.get("scanned_at", ""),
+                )
+    except Exception as e:
+        logger.debug("Could not auto-load depot stock: %s", e)
+    return None
+
+
 # Chain stages — order matters
 STAGES: list[dict[str, Any]] = [
     {

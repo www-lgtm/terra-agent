@@ -13,6 +13,7 @@ from __future__ import annotations
 import ctypes as _ct
 import json
 import logging
+import os
 import platform as _platform
 import threading
 import time as _time
@@ -36,6 +37,284 @@ def _notify_screenshot(message: str) -> None:
         logger.info("base_shift: notify — %s", message[:120])
     except Exception:
         logger.warning("base_shift: notify failed", exc_info=True)
+
+
+def _notify_plan_image(message: str, image_b64: str) -> None:
+    """Send a generated plan image + message to user via WeChat."""
+    try:
+        ctx = getattr(threading.current_thread(), '_terra_agent_ctx', None)
+        if ctx is None:
+            return
+        ctx._notify(message, notify_type="screenshot", image_b64=image_b64)
+        logger.info("base_shift: plan image notify — %s", message[:120])
+    except Exception:
+        logger.warning("base_shift: plan image notify failed", exc_info=True)
+
+
+def _render_plan_image(
+    frontier: list, layout_desc: str, operator_count: int,
+    coverage: float, depot_stock,
+) -> str:
+    """Render ALL plans with A/B dual-shift tables + rotation, return base64 JPEG."""
+    import io as _io
+    import base64 as _b64
+    from PIL import Image, ImageDraw, ImageFont
+
+    _font_paths = []
+    if _platform.system() == "Windows":
+        _font_paths = [
+            "C:/Windows/Fonts/msyh.ttc",
+            "C:/Windows/Fonts/simhei.ttf",
+            "C:/Windows/Fonts/simsun.ttc",
+        ]
+    elif _platform.system() == "Linux":
+        _font_paths = [
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+        ]
+    elif _platform.system() == "Darwin":
+        _font_paths = [
+            "/System/Library/Fonts/PingFang.ttc",
+            "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        ]
+    _font = None
+    for _fp in _font_paths:
+        if Path(_fp).exists():
+            try:
+                _font = ImageFont.truetype(_fp, 14)
+                _font_sm = ImageFont.truetype(_fp, 12)
+                _font_bold = ImageFont.truetype(_fp, 16)
+                _font_title = ImageFont.truetype(_fp, 19)
+                _font_section = ImageFont.truetype(_fp, 17)
+            except Exception:
+                continue
+            break
+    if _font is None:
+        _font = ImageFont.load_default()
+        _font_sm = _font_bold = _font_title = _font_section = _font
+
+    COL_W = [80, 55, 230, 230, 48, 48]
+    ROW_H = 24
+    PAD = 10
+    CANVAS_W = sum(COL_W) + PAD * 2 + 14
+    _HEADERS = ["设施", "产品", "A队（第一班）", "B队（A休息时顶上）", "AEff", "BEff"]
+
+    # ── Summary classification ──
+    _summary: list[str] = []
+    for _pi, _p in enumerate(frontier[:6]):
+        if _p.daily_orundum > 10:
+            _cat = "🟡搓玉"
+        elif _p.daily_lmd <= 0 and _p.daily_combat_record > 0:
+            _cat = "📋作战记录"
+        elif _p.daily_combat_record > _p.daily_lmd * 1.5 and _p.daily_lmd > 0:
+            _cat = "📋作战记录"
+        else:
+            _cat = "💰龙门币"
+        _summary.append(
+            f"方案{_pi + 1} {_cat}  玉{_p.daily_orundum:.0f}  币{_p.daily_lmd:.0f}  记录{_p.daily_combat_record:.0f}"
+        )
+
+    _stock_note = "（未扫仓库，无法计算库存天数）"
+    if depot_stock is not None:
+        from src.intelligence.arknights.base_optimizer import BaseOptimizer
+        _bal = BaseOptimizer.check_resource_balance(frontier[0], None, depot_stock=depot_stock)
+        _gsd = _bal.get("gold_stockpile_days")
+        if _gsd is not None:
+            _stock_note = f"库存可支撑约{_gsd:.0f}天"
+
+    ROT_ROW_H = 22
+    SECTION_GAP = 28
+    SECTION_HEADER_H = 44
+    _total_h = 84
+    _plan_meta: list[dict] = []
+
+    _PROD_FACS = {"Trade", "Mfg", "Power"}
+    for plan in frontier[:6]:
+        _sh = getattr(plan, 'shifts', []) or []
+        is_dual = len(_sh) >= 2
+
+        # Build A/B rows: always show A room; show B only if dual & populated
+        _rows: list[list[str]] = []
+        _b_populated = 0
+        if is_dual:
+            _a_rooms = {f"{r.facility}{r.index}": r for r in _sh[0].rooms}
+            _b_rooms = {f"{r.facility}{r.index}": r for r in _sh[1].rooms}
+            for _key in sorted(_a_rooms):
+                _ar = _a_rooms[_key]
+                _br = _b_rooms.get(_key)
+                _a_ops = _fmt_ops(_ar)
+                _b_ops, _b_eff = "—", "—"
+                if _br and _br.operators:
+                    _b_ops = _fmt_ops(_br)
+                    _b_eff = f"{_br.total_efficiency():.0f}%"
+                    _b_populated += 1
+                _rows.append([
+                    f"{_ar.facility}{_ar.index + 1}", _ar.product or "—",
+                    _a_ops, _b_ops,
+                    f"{_ar.total_efficiency():.0f}%", _b_eff,
+                ])
+        else:
+            for r in _sh[0].rooms:
+                _rows.append([
+                    f"{r.facility}{r.index + 1}", r.product or "—",
+                    _fmt_ops(r), "—",
+                    f"{r.total_efficiency():.0f}%", "—",
+                ])
+
+        # Rotation: compute from A队 production rooms
+        _rot_lines: list[str] = []
+        _rot_h = 0
+        if is_dual and _sh[0].rooms:
+            _a_prod = [r for r in _sh[0].rooms if r.facility in _PROD_FACS]
+            # Group by (facility, product)
+            _by_fp: dict = {}
+            for r in _a_prod:
+                k = (r.facility, r.product)
+                _by_fp.setdefault(k, []).append(r)
+            if _by_fp:
+                # Compute work duration for each group: 24 * (1.0 - threshold) / max_drain
+                _mood_th = 0.35
+                _rot_lines.append("设施   产品       工作    休息    周期      替补")
+                for (_fac, _prod), _rooms in sorted(_by_fp.items()):
+                    _all_ops = []
+                    for r in _rooms:
+                        _all_ops.extend(r.operators)
+                    if not _all_ops:
+                        continue
+                    _max_drain = max(op.morale_drain_per_hour(_fac) for op in _all_ops if hasattr(op, 'morale_drain_per_hour'))
+                    if _max_drain <= 0:
+                        continue
+                    _work_h = 24.0 * (1.0 - _mood_th) / max(_max_drain, 0.01)
+                    _work_h = min(_work_h, 24.0)
+                    _rest_h = _work_h * (_max_drain / (24.0 - _max_drain * _work_h / 24.0))
+                    # Simplified: rest = (mood_lost / recovery_rate), recovery ≈ 2.0/h base
+                    _mood_lost = _work_h * _max_drain
+                    _recovery_rate = 2.0
+                    _rest_h = _mood_lost / _recovery_rate
+                    _cycle = _work_h + _rest_h
+                    # B队覆盖：same key in B shift
+                    _b_covers = "✓" if is_dual else "—"
+                    if is_dual and len(_sh) >= 2:
+                        _br = [r for r in _sh[1].rooms if r.facility == _fac and r.product == _prod and r.operators]
+                        _b_covers = f"{len(_br)}房" if _br else "✗"
+                    _rot_lines.append(
+                        f"{_fac:<6} {_prod:<8} {_work_h:.1f}h   {_rest_h:.1f}h   "
+                        f"{_cycle:.1f}h     {_b_covers}"
+                    )
+                _rot_h = 20 + len(_rot_lines) * ROT_ROW_H + 8
+
+        _section_h = (SECTION_HEADER_H + len(_rows) * ROW_H + ROW_H + _rot_h + 36
+                      if _rot_lines else SECTION_HEADER_H + len(_rows) * ROW_H + ROW_H + 20)
+        _plan_meta.append({
+            "plan": plan, "rows": _rows, "section_h": _section_h,
+            "rot_lines": _rot_lines, "rot_h": _rot_h,
+            "is_dual": is_dual, "b_populated": _b_populated,
+        })
+        _total_h += _section_h + SECTION_GAP
+
+    # ── Draw ──
+    CANVAS_H = _total_h + PAD + 30
+    img = Image.new("RGB", (CANVAS_W, CANVAS_H), "#1a1a2e")
+    draw = ImageDraw.Draw(img)
+
+    y = PAD + 6
+    draw.text((PAD, y), "🏗️ 基建排班方案", fill="#e0e0e0", font=_font_title)
+    y += 24
+    draw.text((PAD, y),
+              f"{layout_desc}  ·  {operator_count}名干员  ·  覆盖率{coverage:.0%}  ·  {len(frontier)}个方案",
+              fill="#8899aa", font=_font_sm)
+    y += 22
+    for _i, _line in enumerate(_summary):
+        draw.text((PAD, y), _line, fill="#ffcc66" if _i == 0 else "#8899aa", font=_font_sm)
+        y += 20
+    y += 4
+    draw.text((PAD, y), _stock_note, fill="#88aacc", font=_font_sm)
+    y += 24
+
+    for _si, _pm in enumerate(_plan_meta):
+        _is_rec = _si == 0
+        _bg = "#1a1a30" if _is_rec else "#16162a"
+        draw.rectangle([(PAD - 4, y), (CANVAS_W - PAD + 4, y + _pm["section_h"])], fill=_bg)
+
+        _cat_label = _summary[_si] if _si < len(_summary) else f"方案{_si + 1}"
+        _star = "⭐ " if _is_rec else ""
+        draw.text((PAD, y + 4), f"{_star}{_cat_label}", fill="#ffcc66" if _is_rec else "#cccccc", font=_font_section)
+        y += SECTION_HEADER_H - 8
+
+        # Table header
+        _hdr_x = PAD
+        for _ci, _h in enumerate(_HEADERS):
+            draw.text((_hdr_x, y), _h, fill="#7799bb", font=_font_bold)
+            _hdr_x += COL_W[_ci]
+        y += ROW_H
+        draw.line([(PAD, y - 1), (CANVAS_W - PAD, y - 1)], fill="#334455", width=1)
+
+        # Rows
+        for _ri, _row in enumerate(_pm["rows"]):
+            _row_x = PAD
+            _rb = "#1e1e38" if _ri % 2 == 0 else "#252545"
+            draw.rectangle([(PAD, y), (CANVAS_W - PAD, y + ROW_H)], fill=_rb)
+            for _ci, _cell in enumerate(_row):
+                if _ci == 2: _c = "#dddddd"
+                elif _ci == 3: _c = "#ddcc88" if _cell != "—" else "#556677"
+                elif _ci in (4, 5): _c = "#66cc88"
+                else: _c = "#8899aa"
+                draw.text((_row_x, y + 3), _cell, fill=_c, font=_font)
+                _row_x += COL_W[_ci]
+            y += ROW_H
+
+        # Rotation schedule
+        _rot = _pm["rot_lines"]
+        if _rot:
+            y += 6
+            draw.text((PAD, y), "🔄 换班节奏（基于A队心情消耗，心情降至35%后 B队顶上）",
+                      fill="#ffaa66", font=_font_sm)
+            y += 20
+            for _rl in _rot:
+                draw.text((PAD, y), _rl, fill="#bbbbbb", font=_font_sm)
+                y += ROT_ROW_H
+            y += 4
+
+        # B team summary — only warn for production facilities (Trade/Mfg)
+        if _pm["is_dual"]:
+            _bp = _pm["b_populated"]
+            _total_a_rooms = len(_pm["rows"])
+            # Count production rooms (Trade, Mfg) — only these need substitutes
+            _prod_rooms = sum(1 for r in _pm["rows"]
+                            if r[0].startswith(("Trade", "Mfg")))
+            # Count B-team production room coverage
+            _bp_prod = sum(1 for r in _pm["rows"]
+                         if r[0].startswith(("Trade", "Mfg")) and r[5] != "—")
+            if _bp_prod == 0 and _prod_rooms > 0:
+                draw.text((PAD, y), "⚠️ B队无可用替补干员，A队休息时生产设施停产",
+                          fill="#cc8866", font=_font_sm)
+                y += 18
+            elif _bp_prod < _prod_rooms:
+                draw.text((PAD, y),
+                          f"💡 B队覆盖 {_bp_prod}/{_prod_rooms} 个生产房间，空房在A队休息期间停产",
+                          fill="#88aacc", font=_font_sm)
+                y += 18
+
+        y += SECTION_GAP - 8
+
+    # Footer
+    draw.text((PAD, y), "按上图设置进驻预设。A/B两队交替：A工作→A休息B顶上→A恢复后换回",
+              fill="#667788", font=_font_sm)
+
+    img_jpg = _io.BytesIO()
+    img.convert("RGB").save(img_jpg, format="JPEG", quality=85)
+    return _b64.b64encode(img_jpg.getvalue()).decode()
+
+
+def _fmt_ops(room) -> str:
+    """Format operator list for a room — compact with overflow count."""
+    if not room.operators:
+        return "（空缺）"
+    ops = "、".join(op.name for op in room.operators[:6])
+    if len(room.operators) > 6:
+        ops += f"…({len(room.operators)}人)"
+    return ops
 
 # ── DLL discovery ──────────────────────────────────────────────────────
 
@@ -227,14 +506,7 @@ def _write_custom_plan(
 
     _CUSTOM_PLAN_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Clean up old plan files — keep only the latest.
-    for old in sorted(_CUSTOM_PLAN_DIR.glob("base_plan_*.json")):
-        try:
-            old.unlink()
-        except OSError:
-            pass
-
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
     path = _CUSTOM_PLAN_DIR / f"base_plan_{ts}.json"
     payload: dict = {
         "plans": maa_plans,
@@ -331,7 +603,20 @@ def _write_custom_plan(
                 len(rotation_plan_map), len(maa_plans),
             )
 
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    # Write to temp file first, then atomically rename (Windows os.replace is atomic).
+    tmp_path = path.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp_path, path)
+
+    # Clean up old plan files — keep only the latest.
+    for old in sorted(_CUSTOM_PLAN_DIR.glob("base_plan_*.json")):
+        if old == path:
+            continue
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
     total_rooms = sum(sum(len(v) for v in p["rooms"].values()) for p in maa_plans)
     mode_tag = "+dorm" if any("dormitory" in str(p) for p in maa_plans) else ""
     logger.info("Wrote MAA custom plan: %s (%d shifts, %d total rooms%s, facilities=%s, drone=%s)",
@@ -362,7 +647,7 @@ def _auto_drone_from_solution(solution) -> str:
 _MAA_INFRAST_TIMEOUT = 900  # 15 min — custom plans may touch all facilities
 
 
-def _run_maa_infrast(handle, params: dict, mode: str, adb_addr: str) -> ToolOutput:
+def _run_maa_infrast(params: dict, mode: str, adb_addr: str) -> ToolOutput:
     """Append Infrast task, start, poll until done, return _ok or _error."""
     results: list[dict] = []
     task_status = ""         # "Success" | "Failed" from top-level callback
@@ -566,7 +851,7 @@ def base_shift_maa(
     else:
         return _error(f"不支持的模式: {mode}。可选: default, custom, rotation")
 
-    return _run_maa_infrast(None, params, mode, adb_addr)
+    return _run_maa_infrast(params, mode, adb_addr)
 
 
 # ── Register ───────────────────────────────────────────────────────────
@@ -706,16 +991,16 @@ def base_plan() -> ToolOutput:
     except Exception:
         pass
 
-    # ── 4. Run optimizer on 243 (most universal layout) ────────────
+    # ── 4. Run optimizer (read layout from cache, fallback to 243) ──
     inventory = parse_inventory("")
     NEUTRAL = (0.40, 0.35, 0.25)
-    layout = "243"
+    layout = cache.get("layout") if cache and cache.get("layout") else "243"
 
     try:
         optimizer = BaseOptimizer(ctx.knowledge)
         logger.info("base_plan: optimizing layout=%s operators=%d", layout, len(operator_box))
         frontier = optimizer.solve_pareto(
-            operator_box, layout, num_shifts=0,
+            operator_box, layout, num_shifts=2,
             sort_weights=NEUTRAL,
             inventory=inventory,
             mood_threshold=0.35,
@@ -727,49 +1012,27 @@ def base_plan() -> ToolOutput:
                 "error": "无法生成方案",
                 "message": "当前干员列表无法填满布局。",
             }, ensure_ascii=False))
-        coverage = frontier[0].coverage if frontier else 0
 
-        # ── Dedup by actual daily output ─────────────────────────────
-        # The optimizer uses normalized efficiency (0-1) for Pareto, so two
-        # plans with the same raw output but different efficiencies both
-        # survive.  To the user, "37,500 LMD + 0 record" and
-        # "37,500 LMD + 30 records" look like a bug — the latter strictly
-        # dominates.  Remove strictly-dominated-by-raw-output plans.
-        _output_map: dict[tuple[int, int, int], int] = {}
-        _keep: list[bool] = [True] * len(frontier)
+        # ── Category-based dedup: one best plan per goal ───────────
+        _best_per_cat: dict[str, tuple[int, float]] = {}
         for pi, plan in enumerate(frontier):
-            key = (
-                int(plan.daily_orundum),
-                int(plan.daily_lmd),
-                int(plan.daily_combat_record),
-            )
-            if key in _output_map:
-                # Same raw output — keep the one with better coverage (or first)
-                existing = _output_map[key]
-                if plan.coverage > frontier[existing].coverage:
-                    _keep[existing] = False
-                    _output_map[key] = pi
-                else:
-                    _keep[pi] = False
+            if plan.daily_orundum > 10:
+                cat, score = "搓玉", plan.daily_orundum
+            elif plan.daily_lmd > 0 and plan.daily_combat_record > plan.daily_lmd * 1.5:
+                cat, score = "作战记录", plan.daily_combat_record
+            elif plan.daily_combat_record > 0 and plan.daily_lmd == 0:
+                cat, score = "作战记录", plan.daily_combat_record
             else:
-                _output_map[key] = pi
+                cat, score = "龙门币", plan.daily_lmd
+            if cat not in _best_per_cat or score > _best_per_cat[cat][1]:
+                _best_per_cat[cat] = (pi, score)
 
-        # Also remove plans that are strictly dominated in raw output
-        for pi, plan in enumerate(frontier):
-            if not _keep[pi]:
-                continue
-            for pj, other in enumerate(frontier):
-                if pi == pj or not _keep[pj]:
-                    continue
-                a_o, a_l, a_c = int(plan.daily_orundum), int(plan.daily_lmd), int(plan.daily_combat_record)
-                b_o, b_l, b_c = int(other.daily_orundum), int(other.daily_lmd), int(other.daily_combat_record)
-                if b_o >= a_o and b_l >= a_l and b_c >= a_c and (b_o > a_o or b_l > a_l or b_c > a_c):
-                    _keep[pi] = False
-                    break
-
-        frontier = [p for pi, p in enumerate(frontier) if _keep[pi]]
-        logger.info("base_plan: deduped frontier %d → %d plans",
-                   len(_keep), len(frontier))
+        _keep_idx = sorted(idx for idx, _ in _best_per_cat.values())
+        frontier = [frontier[i] for i in _keep_idx]
+        logger.info("base_plan: category-deduped %d → %d plans (%s)",
+                   len(_best_per_cat), len(frontier),
+                   ", ".join(f"{c}" for c in _best_per_cat))
+        coverage = frontier[0].coverage if frontier else 0
     except Exception as e:
         logger.error("base_plan: optimization failed: %s", e, exc_info=True)
         return ToolOutput(text=json.dumps({
@@ -896,30 +1159,43 @@ def base_plan() -> ToolOutput:
     BaseScheduler._set_cache({
         "frontier": frontier,
         "box": operator_box,
+        "layout": layout,
         "layout_desc": layout_desc,
         "operators": operators_resolved,
         "inventory": inventory,
         "depot_stock": depot_stock,
+        "plan_index_map": {i: fi for i, fi in enumerate(_keep_idx)},
     })
 
     logger.info("base_plan: %d plans generated for %d operators",
                len(frontier), len(operator_box))
 
     # ── 7. Auto-notify ──────────────────────────────────────────────
-    # Send a concise summary directly to the user so they see the result
+    # Send ALL plans as a single tall table image so the user can see
+    # every room's operator assignments for every plan.
     summary_lines = [
         f"🏗️ 基建排班方案（{len(operator_box)}名干员，{layout_desc}，覆盖率{coverage:.0%}）",
         "",
-        f"共 {len(frontier)} 个方案：",
+        f"共 {len(frontier)} 个方案，详情见图片 ↓",
     ]
-    for s in summaries:
-        depo_note = f"｜库存约{s.get('stockpile_days', '?')}天" if s.get("stockpile_days") else ""
-        summary_lines.append(f"  {s['category']} — 合成玉{s['orundum']} 龙门币{s['lmd']} 作战记录{s['combat_record']}{depo_note}")
-    if not depot_stock:
-        summary_lines.append("")
-        summary_lines.append("💡 扫仓库后可显示每方案能撑几天")
 
-    _notify_screenshot("\n".join(summary_lines))
+    # Render all plans as one tall PNG
+    try:
+        _img = _render_plan_image(frontier, layout_desc,
+                                  len(operator_box), coverage, depot_stock)
+        _notify_plan_image("\n".join(summary_lines), _img)
+    except Exception:
+        logger.warning("base_plan: failed to render plan image, fallback to screenshot", exc_info=True)
+        _notify_screenshot("\n".join(summary_lines))
+
+    # ── Warehouse note in tool output ──
+    _wh_hint = ""
+    if depot_stock is None:
+        _wh_hint = (
+            "\n\n⚠️ 没有仓库数据，各方案的库存可持续天数未计算。"
+            "下次排班时，先按技能流程去仓库截图问用户材料数量，"
+            "save_depot_resources 写入后再出方案，就能看到每个方案能撑几天。"
+        )
 
     return ToolOutput(text=json.dumps({
         "success": True,
@@ -927,34 +1203,14 @@ def base_plan() -> ToolOutput:
         "operator_count": len(operator_box),
         "plan_count": len(frontier),
         "has_depot": depot_stock is not None,
-        "message": plan_text,
+        "message": plan_text + _wh_hint,
     }, ensure_ascii=False))
 
 
 def _load_depot_stock(cache: dict | None):
-    """Load depot stock from cache or latest session. Returns None if unavailable."""
-    if cache and cache.get("depot_stock"):
-        return cache["depot_stock"]
-    try:
-        from src.intelligence.arknights.base_chain import SESSION_DIR
-        if SESSION_DIR.exists():
-            sessions = sorted(
-                [s for s in SESSION_DIR.iterdir()
-                 if s.is_dir() and (s / "warehouse.json").exists()],
-                key=lambda p: p.stat().st_mtime, reverse=True,
-            )
-            if sessions:
-                wh_data = json.loads((sessions[0] / "warehouse.json").read_text(encoding="utf-8"))
-                from src.games.arknights.operators import MaterialStock
-                logger.info("base_plan: auto-loaded depot from %s", sessions[0].name)
-                return MaterialStock(
-                    items=wh_data.get("items", {}),
-                    lmd=wh_data.get("lmd", 0),
-                    scanned_at=wh_data.get("scanned_at", ""),
-                )
-    except Exception as e:
-        logger.debug("base_plan: no depot data: %s", e)
-    return None
+    """Load depot stock from cache or latest session. Thin wrapper over shared utility."""
+    from src.intelligence.arknights.base_chain import load_depot_stock_from_session
+    return load_depot_stock_from_session(cache)
 
 
 registry.register(

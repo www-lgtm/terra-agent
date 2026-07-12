@@ -164,6 +164,10 @@ class AgentConfig:
     # DEFAULT OFF: produces garbage v2 variants that pollute the skill index.
     # Enable only when actively developing and reviewing generated skills.
     enable_skill_refinement: bool = False
+    # Skill generation (auto-create new skill .md files from action chains)
+    # DEFAULT OFF: generates garbage with bad names and coordinates from
+    # loading screens/misclicks. Hand-author skills instead.
+    enable_skill_generation: bool = False
     # Learning engine (Phase 1-3)
     learning_injection_attribution_window: int = 3  # Turns after injection to check for help
     learning_pattern_miner_interval: int = 10       # Tasks between pattern miner runs

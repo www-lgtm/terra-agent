@@ -217,10 +217,38 @@ def _generate_combos(tags, tag_index, owned, strategy):
     results = []
     max_k = min(3, len(tags))
 
+    # Slot-level rarity gates — without these tags in the slot, those rarities
+    # can never appear regardless of tag combination or timer (9h only guarantees 4★).
+    slot_has_top = "高级资深干员" in tags
+    slot_has_senior = "资深干员" in tags
+
     for k in range(1, max_k + 1):
         for combo in combinations(tags, k):
             selected = list(combo)
             ops = _intersect_operators(selected, tag_index)
+            if not ops:
+                continue
+
+            # ── Filter impossible rarities ──
+            # 6★: impossible without 高资 (铁律 — this tag only appears when 6★ pool is rolled)
+            if not slot_has_top:
+                ops = [op for op in ops if op["rarity"] != 6]
+                if not ops:
+                    continue
+
+            # 5★: only filter if a 4★ fallback exists in the intersection.
+            # Some tag combos (e.g. 位移+减速, 召唤+辅助干员) naturally lock 5★+
+            # even without 资深干员 — the intersection has no 4★ or below to fall back to.
+            if not slot_has_senior:
+                rarities = set(op["rarity"] for op in ops)
+                # Natural 5★+ lock: all non-robot ops are 5★/6★, at least one 5★ exists
+                has_natural_5star = (
+                    all(r in (5, 6, 1) for r in rarities)
+                    and 5 in rarities
+                )
+                if not has_natural_5star:
+                    ops = [op for op in ops if op["rarity"] != 5]
+
             if not ops:
                 continue
 

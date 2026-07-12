@@ -327,6 +327,26 @@ def _optimize(tags: list[str], strategy: str) -> dict:
 # Phase 1: Collect ready candidates
 # ═════════════════════════════════════════════════════════════════════════
 
+def _poll_skip(adb, w: int, h: int, timeout: float = 6.0) -> bool:
+    """Poll for SKIP button during recruitment animation, tap as soon as found.
+
+    Also handles the case where the result screen appears instantly (fast device
+    or no animation) — if result keywords are detected, returns True immediately.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        texts = " ".join(d["text"] for d in ocr_engine.read_text(adb.get_screenshot_image()))
+        # Result screen already visible — no need to skip
+        if any(kw in texts for kw in _RESULT_KW):
+            return True
+        # Look for SKIP and tap it
+        if _find_tap(adb, "SKIP", w, h):
+            logger.info("recruit: SKIP tapped")
+            return True
+        time.sleep(0.4)
+    return False
+
+
 def _collect_candidates(adb, w: int, h: int) -> int:
     """Collect all ready candidates (聘用候选人). Returns count collected."""
     collected = 0
@@ -342,33 +362,48 @@ def _collect_candidates(adb, w: int, h: int) -> int:
         cx, cy = d["center"]
         logger.info("recruit: phase1 — collect candidate at (%d,%d)", cx, cy)
 
-        before = compute_dhash(adb.get_screenshot_image())
         adb.shell("input", "tap", str(cx), str(cy))
 
-        # Wait for the recruitment result screen (animation + result)
-        # The animation shows SKIP first, then result text
-        time.sleep(0.8)
+        # ── Poll for SKIP during animation (up to 6s) ──
+        _poll_skip(adb, w, h, timeout=6.0)
 
-        # ── Handle SKIP animation ──
-        if _find_tap(adb, "SKIP", w, h):
+        # After SKIP, the operator reveal screen appears (character art +
+        # operator name, "获得" text, 资质凭证 etc.).  Tap the screen
+        # center to dismiss it — this is the game's expected interaction.
+        # back() is unreliable here because it's not a popup, it's a
+        # full-screen reveal.
+        time.sleep(0.3)
+
+        # ── Dismiss operator reveal screen ──
+        logger.info("recruit: phase1 — tapping to dismiss operator reveal")
+        for _tap in range(3):
+            adb.shell("input", "tap", str(int(w * 0.50)), str(int(h * 0.70)))
+            time.sleep(0.3)
+            # Check if we're back on the slot list
+            if _wait_for_keywords(adb, _SLOT_LIST_KW, timeout=2.0):
+                break
+            logger.info("recruit: phase1 — tap %d didn't return to slot list, retrying", _tap + 1)
+        else:
+            # Taps didn't work — try back as last resort
+            logger.warning("recruit: phase1 — tap failed, trying back")
+            adb.press_back()
             time.sleep(0.5)
-        # Wait for result screen (has "获得", "资质凭证", or "信物")
-        _wait_for_keywords(adb, _RESULT_KW, timeout=4.0)
-        time.sleep(0.3)
+            if not _wait_for_keywords(adb, _SLOT_LIST_KW, timeout=4.0):
+                logger.warning("recruit: phase1 — back also failed, trying one more tap")
+                adb.shell("input", "tap", str(int(w * 0.50)), str(int(h * 0.70)))
+                time.sleep(0.3)
+                _wait_for_keywords(adb, _SLOT_LIST_KW, timeout=3.0)
 
-        # ── Dismiss result popup ──
-        # Tap center-right area to dismiss, then press back to be safe
-        adb.shell("input", "tap", str(int(w * 0.50)), str(int(h * 0.85)))
-        time.sleep(0.4)
-        adb.press_back()
-        time.sleep(0.3)
+        # ── Only count if we confirmed return to slot list ──
+        texts = " ".join(d["text"] for d in ocr_engine.read_text(adb.get_screenshot_image()))
+        if any(kw in texts for kw in _SLOT_LIST_KW):
+            collected += 1
+            logger.info("recruit: phase1 — candidate %d collected and confirmed on slot list", collected)
+        else:
+            logger.warning("recruit: phase1 — candidate slot may not have been collected; not on slot list")
+            # Don't increment collected — the dismiss failed
 
-        # ── Wait for slot list screen ──
-        _wait_for_keywords(adb, _SLOT_LIST_KW, timeout=5.0)
-        time.sleep(0.3)
-
-        collected += 1
-        logger.info("recruit: phase1 — candidate %d collected", collected)
+        time.sleep(0.2)
 
     logger.info("recruit: phase1 — collected %d candidates total", collected)
     return collected
@@ -384,6 +419,20 @@ def _start_new_recruits(adb, w: int, h: int, contacts: int,
     results: list[dict] = []
     remaining_contacts = contacts
     max_rounds = 4
+
+    # ── Validate we're on the recruitment list ──
+    texts = " ".join(d["text"] for d in ocr_engine.read_text(adb.get_screenshot_image()))
+    if not any(kw in texts for kw in _SLOT_LIST_KW):
+        logger.warning("recruit: phase2 — not on recruitment list at start, pressing back to recover")
+        for _ in range(4):
+            adb.press_back()
+            time.sleep(0.5)
+            texts = " ".join(d["text"] for d in ocr_engine.read_text(adb.get_screenshot_image()))
+            if any(kw in texts for kw in _SLOT_LIST_KW):
+                logger.info("recruit: phase2 — recovered to slot list")
+                break
+        else:
+            logger.warning("recruit: phase2 — could not recover to slot list, attempting to proceed anyway")
 
     for _round in range(max_rounds):
         empty_slots = _find_all_ocr(adb, "开始招募干员")
@@ -502,14 +551,10 @@ def _process_one_slot(adb, w: int, h: int, click_pos: tuple[int, int],
                 _tap_tag(adb, tag, pos[0], pos[1])
 
         # ── Set time ──
-        # Always use 9h unless the optimizer explicitly says 1:00 AND has a
-        # good reason (支援机械 tier=1 — robots work at 1:00).
-        # For tier=0 (no guarantee), 9h gives the hard 4★ guarantee from timer.
+        # Use the optimizer's recommendation directly.  It knows which
+        # tags benefit from specific timers (e.g. 支援机械=1:00 for robots,
+        # 9:00 for 4★ hard guarantee).
         actual_time = time_req
-        if tier == 0 and time_req == "1:00":
-            # tier=0: no tag guarantee. 9h timer guarantees 4★ regardless of tags.
-            actual_time = "9:00"
-            logger.info("recruit: slot %d — overriding time 1:00→9:00 (tier=%d, 9h hard-guarantees 4★)", slot_idx, tier)
         if actual_time == "9:00":
             _set_9h(adb, w, h)
             time.sleep(0.3)
@@ -684,6 +729,20 @@ def recruit(strategy: str = "collection") -> ToolOutput:
     # ── Step 2: Phase 1 — Collect ready candidates ──
     logger.info("recruit: === Phase 1: Collect candidates ===")
     collected = _collect_candidates(adb, w, h)
+
+    # ── Validate slot list before Phase 2 ──
+    # Phase 1 should leave us on the slot list, but if something went wrong
+    # (e.g. animation interrupted navigation), press back repeatedly to recover.
+    texts = " ".join(d["text"] for d in ocr_engine.read_text(adb.get_screenshot_image()))
+    if not any(kw in texts for kw in _SLOT_LIST_KW):
+        logger.warning("recruit: not on slot list after Phase 1, recovering with repeated back")
+        for _ in range(4):
+            adb.press_back()
+            time.sleep(0.5)
+            texts = " ".join(d["text"] for d in ocr_engine.read_text(adb.get_screenshot_image()))
+            if any(kw in texts for kw in _SLOT_LIST_KW):
+                logger.info("recruit: recovered to slot list between phases")
+                break
 
     # ── Step 3: Phase 2 — Start new recruitments ──
     logger.info("recruit: === Phase 2: Start new recruitments ===")

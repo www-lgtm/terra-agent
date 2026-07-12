@@ -282,13 +282,36 @@ def _op_dorm_recovery_rate(op: 'Operator') -> float:
         if op.level > 0 and sk.level_required > op.level:
             continue
         # Fiammetta override: "自身心情每小时恢复+2，同时无法获得其他来源"
+        # Note: base 0.75 is innate (not from "other sources"), so total = 2.75
         if sk.dorm_self_recovery >= 2.0:
-            return 2.0
+            return base + sk.dorm_self_recovery
         self_bonus += sk.dorm_self_recovery
     return base + self_bonus
 
 
 # ── Morale-driven scheduling algorithms ───────────────────────────────
+
+def _make_rest_group(
+    gid: int, facility: str, product: str, rooms: list['Room'],
+    group_ops: list['Operator'],
+) -> RestGroup:
+    """Build a single RestGroup from a pre-computed (facility, product) room group."""
+    work_morale_drain = max(
+        op.morale_drain_per_hour(facility) for op in group_ops
+    )
+    work_efficiency = sum(
+        op.efficiency_for(product, facility) for op in group_ops
+    )
+    return RestGroup(
+        group_id=gid,
+        facility=facility,
+        room_indices=[r.index for r in rooms],
+        operators=group_ops,
+        product=product,
+        work_morale_drain=work_morale_drain,
+        work_efficiency=work_efficiency,
+    )
+
 
 def _build_rest_groups(
     config: 'ProductConfig',
@@ -347,23 +370,7 @@ def _build_rest_groups(
         for op in group_ops:
             used_names.add(op.name)
 
-        # Compute group metrics
-        work_morale_drain = max(
-            op.morale_drain_per_hour(facility) for op in group_ops
-        )
-        work_efficiency = sum(
-            op.efficiency_for(product, facility) for op in group_ops
-        )
-
-        groups.append(RestGroup(
-            group_id=gid,
-            facility=facility,
-            room_indices=room_indices,
-            operators=group_ops,
-            product=product,
-            work_morale_drain=work_morale_drain,
-            work_efficiency=work_efficiency,
-        ))
+        groups.append(_make_rest_group(gid, facility, product, rooms, group_ops))
         gid += 1
 
     return groups
@@ -375,18 +382,20 @@ def _build_rest_groups_from_shifts(
 ) -> list[RestGroup]:
     """Build RestGroups from SA's actual room assignments in the first shift.
 
-    This replaces _build_rest_groups() which rebuilds groups from config+teams
-    independently of what SA actually placed. Now groups match the real
-    operator assignments, so work/rest durations are accurate.
+    Only production facilities (Trade/Mfg/Power) form rest groups — fixed
+    facilities (Control/Office/Reception/Dorm) run 24/7 and don't rotate.
     """
     if not shifts:
         return []
     op_map = {op.name: op for op in operators}
-    shift = shifts[0]  # primary shift determines the work groups
+    shift = shifts[0]  # primary (A队) shift determines the work groups
+    _PROD_FACS = {"Trade", "Mfg", "Power"}
 
     # Group rooms by (facility, product)
     rooms_by_fp: dict[tuple[str, str], list['Room']] = {}
     for room in shift.rooms:
+        if room.facility not in _PROD_FACS:
+            continue
         key = (room.facility, room.product)
         rooms_by_fp.setdefault(key, []).append(room)
 
@@ -404,22 +413,7 @@ def _build_rest_groups_from_shifts(
         if not group_ops:
             continue
 
-        work_morale_drain = max(
-            op.morale_drain_per_hour(facility) for op in group_ops
-        )
-        work_efficiency = sum(
-            op.efficiency_for(product, facility) for op in group_ops
-        )
-
-        groups.append(RestGroup(
-            group_id=gid,
-            facility=facility,
-            room_indices=[r.index for r in rooms],
-            operators=group_ops,
-            product=product,
-            work_morale_drain=work_morale_drain,
-            work_efficiency=work_efficiency,
-        ))
+        groups.append(_make_rest_group(gid, facility, product, rooms, group_ops))
         gid += 1
 
     return groups
@@ -957,8 +951,20 @@ class Operator:
             return False  # known level too low
         return True
 
+    def __post_init__(self):
+        """Initialize per-operator caches (skills are immutable after _resolve_operators)."""
+        object.__setattr__(self, '_eff_cache', {})
+
     def efficiency_for(self, product: str, facility: str) -> float:
-        """Efficiency for a product, only counting unlocked skills."""
+        """Efficiency for a product, only counting unlocked skills.
+
+        Results are cached since operator skills don't change during a single
+        solve_pareto() call — this is the hottest path in the SA inner loop.
+        """
+        key = (product, facility)
+        cached = self._eff_cache.get(key)
+        if cached is not None:
+            return cached
         total = 0.0
         for skill in self.skills:
             if not self._skill_unlocked(skill):
@@ -969,6 +975,7 @@ class Operator:
                 total += skill.efficiency[product]
             elif "all" in skill.efficiency:
                 total += skill.efficiency["all"]
+        self._eff_cache[key] = total
         return total
 
     def active_combos(self, facility: str) -> list[ComboDescriptor]:
@@ -1268,8 +1275,8 @@ def enumerate_product_configs(layout: str) -> list[ProductConfig]:
 # ═══════════════════════════════════════════════════════════════════
 
 def _sa_temperature(step: int, total: int, T0: float = 2.0) -> float:
-    """Exponential cooling schedule."""
-    return T0 * (0.01 / T0) ** (step / total)
+    """Exponential cooling schedule — slightly faster cooling for quicker convergence."""
+    return T0 * (0.005 / T0) ** (step / total)
 
 
 def _sa_accept_prob(delta: float, T: float) -> float:
@@ -1770,8 +1777,8 @@ class BaseOptimizer:
         best = opt.solve_with_weights(frontier, orundum=0.50, lmd=0.30, combat_record=0.20)
     """
 
-    SA_STEPS = 400      # Simulated annealing iterations per config (3 move types)
-    SA_SEEDS = 3        # Multi-start: run SA from N random seeds, take best
+    SA_STEPS = 300      # Simulated annealing iterations per config (cooled faster)
+    SA_SEEDS = 3         # Multi-start: run SA from N random seeds, take best
 
     def __init__(self, knowledge_base=None):
         self.kb = knowledge_base
@@ -1969,141 +1976,106 @@ class BaseOptimizer:
             else:
                 weights = base_weights
 
-            # ── Multi-shift: expand rooms to N copies ──
-            # Each shift gets identical production rooms. SA runs on all rooms
-            # at once, with the one-operator-per-day constraint enforced.
-            # Fixed facilities (Control, Office, Reception) are added once —
-            # they are assigned in the first shift and don't rotate.
-            all_rooms: list[Room] = []
-            for shift_idx in range(num_shifts):
-                for room in config.to_rooms():
-                    all_rooms.append(Room(
-                        facility=room.facility,
-                        product=room.product,
-                        index=room.index,
-                        max_slots=room.max_slots,
-                    ))
-            # Fixed rooms (appended once, will be placed in shift 0 only)
+            # ── Multi-shift: A-first sequential SA ──
+            # Two-pass for num_shifts>=2: A队 gets top pick of ALL operators,
+            # B队 gets best-of-remaining.  This avoids one-pass global SA
+            # splitting top operators across both shifts (mediocre efficiency
+            # for both) and matches how real players schedule their base.
+            prod_rooms = config.to_rooms()
             fixed_facs = _get_fixed_facilities(layout)
-            fixed_start_idx = len(all_rooms)
-            for fac, prod, slots in fixed_facs:
-                all_rooms.append(Room(
-                    facility=fac, product=prod,
-                    index=0, max_slots=slots,
-                ))
 
-            # Multi-start SA with team warm-start (no locking)
-            # Teams are pre-placed as a superior greedy init, then SA
-            # can freely reorganize -- keeping truly synergistic combos
-            # (Texas+Lapland +65%) while splitting non-synergistic groups.
-            best_score = -1.0
-            best_all_rooms: list[Room] = all_rooms
-            team_used: set[str] = set()
+            def _clone_rooms(rooms):
+                return [Room(facility=r.facility, product=r.product,
+                             index=r.index, max_slots=r.max_slots)
+                        for r in rooms]
 
-            for seed in range(self.SA_SEEDS):
-                fresh_rooms = [
-                    Room(facility=r.facility, product=r.product,
-                         index=r.index, max_slots=r.max_slots)
-                    for r in all_rooms
-                ]
-                # Warm-start: pre-place community teams as greedy init hints
-                if ready_teams:
-                    committed_for_init: set[str] = set()
-                    for team in ready_teams:
-                        tn = {op.name for op in team.operators}
-                        if tn & committed_for_init:
-                            continue
-                        hint = team.template.product_hint
-                        best_room = None
-                        for room in fresh_rooms:
-                            if room.facility != team.template.facility:
-                                continue
-                            if room.operators:
-                                continue
-                            if len(team.operators) > room.max_slots:
-                                continue
-                            if hint and room.product == hint:
-                                best_room = room
-                                break
-                        if best_room is None:
-                            for room in fresh_rooms:
-                                if room.facility != team.template.facility:
-                                    continue
-                                if room.operators:
-                                    continue
-                                if len(team.operators) > room.max_slots:
-                                    continue
-                                best_room = room
-                                break
-                        if best_room is not None:
-                            # Validate each member has an unlocked skill for this room
-                            valid_ops: list[Operator] = []
-                            for op in team.operators:
-                                if op.efficiency_for(best_room.product, best_room.facility) > 0:
-                                    valid_ops.append(op)
-                                elif hint:
-                                    # Try without product hint (any product in this facility)
-                                    any_eff = any(
-                                        op.efficiency_for(p, best_room.facility) > 0
-                                        for p in FACILITY_PRODUCTS.get(best_room.facility, [])
-                                    )
-                                    if any_eff:
-                                        valid_ops.append(op)
-                            if len(valid_ops) < len(team.operators):
-                                skipped = [op.name for op in team.operators
-                                          if op not in valid_ops]
-                                _skip_key = (team.template.name, hash(frozenset(skipped)))
-                                if _skip_key not in _skip_logged:
-                                    _skip_logged.add(_skip_key)
-                                    logger.info(
-                                        "Warm-start: skipping %s from team '%s' — "
-                                        "skills not unlocked at E%d/Lv%d",
-                                        skipped, team.template.name,
-                                        max(op.elite_level for op in team.operators
-                                            if op.name in skipped),
-                                        max((op.level or 0) for op in team.operators
-                                            if op.name in skipped),
-                                    )
-                            if valid_ops:
-                                best_room.operators = valid_ops
-                                committed_for_init |= {op.name for op in valid_ops}
+            def _run_sa(rooms, ops, seed_offset: int):
+                """Run multi-seed SA on given rooms+operators, return best assignment."""
+                best = 0.0
+                best_assigned = rooms
+                for seed in range(self.SA_SEEDS):
+                    fresh = _clone_rooms(rooms)
+                    assigned = simulated_annealing_assignment(
+                        rooms=fresh, operators=ops, weights=weights,
+                        steps=self.SA_STEPS, seed=seed * 1000 + ci + seed_offset,
+                        shift_hours=shift_hours,
+                    )
+                    score = sum(
+                        weights.get(f"{r.facility}:{r.product}", 0.1) * r.total_efficiency()
+                        for r in assigned
+                    )
+                    if score > best:
+                        best = score
+                        best_assigned = assigned
+                return best_assigned
 
-                # Standard SA -- NO locked_names. SA freely reorganizes.
-                assigned = simulated_annealing_assignment(
-                    rooms=fresh_rooms,
-                    operators=operators,
-                    weights=weights,
-                    steps=self.SA_STEPS,
-                    seed=seed * 1000 + ci,
-                    shift_hours=shift_hours,
-                )
-                raw_score = sum(
+            if num_shifts >= 2:
+                # ── Pass 1: A队 — top priority, ALL operators ──
+                a_rooms = _clone_rooms(prod_rooms)
+                for fac, prod, slots in fixed_facs:
+                    a_rooms.append(Room(facility=fac, product=prod, index=0, max_slots=slots))
+                best_a = _run_sa(a_rooms, operators, 0)
+                # Collect used operators
+                a_used: set[str] = set()
+                for r in best_a:
+                    for op in r.operators:
+                        a_used.add(op.name)
+                # ── Pass 2: B队 — remaining operators only ──
+                remaining = [op for op in operators if op.name not in a_used]
+                b_rooms = _clone_rooms(prod_rooms)
+                best_b = _run_sa(b_rooms, remaining, 1000)
+                # Merge: A production rooms first, then B production rooms
+                best_all_rooms = best_a + best_b
+                fixed_start_idx = len(best_a)
+                best_score = sum(
                     weights.get(f"{r.facility}:{r.product}", 0.1) * r.total_efficiency()
-                    for r in assigned
+                    for r in best_all_rooms
                 )
-                if raw_score > best_score:
-                    best_score = raw_score
-                    best_all_rooms = assigned
-                    team_used = committed_for_init if ready_teams else set()
-
-            # Split back into per-shift rooms
-            # Production rooms only (fixed rooms are at indices >= fixed_start_idx)
-            prod_all = best_all_rooms[:fixed_start_idx]
-            fixed_all = best_all_rooms[fixed_start_idx:]
-            rooms_per_shift = len(prod_all) // num_shifts
+            else:
+                # ── Single-shift: original SA ──
+                all_rooms_single = []
+                for room in prod_rooms:
+                    all_rooms_single.append(Room(
+                        facility=room.facility, product=room.product,
+                        index=room.index, max_slots=room.max_slots))
+                for fac, prod, slots in fixed_facs:
+                    all_rooms_single.append(Room(
+                        facility=fac, product=prod, index=0, max_slots=slots))
+                fixed_start_idx = len(all_rooms_single) - len(fixed_facs)
+                best_assigned = _run_sa(all_rooms_single, operators, 0)
+                best_all_rooms = best_assigned
+                best_score = sum(
+                    weights.get(f"{r.facility}:{r.product}", 0.1) * r.total_efficiency()
+                    for r in best_assigned
+                )
+            # ── Build shifts from best_all_rooms ──
             shifts: list[Shift] = []
-            for shift_idx in range(num_shifts):
-                start = shift_idx * rooms_per_shift
-                end = start + rooms_per_shift
-                shift_rooms = prod_all[start:end]
-                # Fixed facilities only go to shift 0 (A组)
-                if shift_idx == 0:
-                    shift_rooms = shift_rooms + fixed_all
-                shifts.append(Shift(
-                    name=shift_names[shift_idx],
-                    duration_hours=shift_hours,
-                    rooms=shift_rooms,
-                ))
+            if num_shifts >= 2:
+                # Two-pass: best_a = production + fixed, best_b = production only.
+                # Fixed facilities (Control/Office/Reception/Dorm) don't rotate —
+                # they keep the same operators 24/7, so copy A's fixed rooms to B.
+                prod_count = len(best_a) - len(fixed_facs)
+                a_prod = best_a[:prod_count]
+                a_fixed = best_a[prod_count:]
+                b_prod = best_b
+                # Shallow-clone A's fixed rooms for B shift (same operators, same rooms)
+                b_fixed = [Room(facility=r.facility, product=r.product,
+                                index=r.index, max_slots=r.max_slots,
+                                operators=list(r.operators))
+                          for r in a_fixed]
+                shifts = [
+                    Shift(name="A组", duration_hours=shift_hours,
+                          rooms=a_prod + a_fixed),
+                    Shift(name="B组", duration_hours=shift_hours,
+                          rooms=b_prod + b_fixed),
+                ]
+            else:
+                # Single-shift: production rooms + fixed at end
+                prod_count = len(best_all_rooms) - len(fixed_facs)
+                shifts = [
+                    Shift(name="A组", duration_hours=shift_hours,
+                          rooms=best_all_rooms[:prod_count] + best_all_rooms[prod_count:]),
+                ]
 
             # Compute daily-average output metrics
             orundum_eff = 0.0

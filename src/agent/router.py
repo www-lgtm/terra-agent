@@ -215,13 +215,14 @@ def search_skills(query: str, game: str = "arknights", limit: int = 5) -> list[d
                     results = filtered_tag
             # Recompute max after drop
             max_hits = max(s["_tag_hits"] for s in results)
-            # Dominant match: top skill has ≥3x the tag hits of second place.
-            # Raised from 2x because "日常+任务" in user's question about
-            # annihilation was matching daily's tags and killing annihilation.
-            if max_hits >= 3 and len(results) >= 2:
+            # Dominant match: top skill has ≥2x the tag hits of second place.
+            # Lowered from 3x to 2x — 3x was letting adjacent skills
+            # (e.g. base-reception-clue with 1 hit when base-shift has 2)
+            # survive and become false mandatory sub-tasks.
+            if max_hits >= 2 and len(results) >= 2:
                 sorted_hits = sorted(results, key=lambda s: -(s.get("_tag_hits", 0)))
                 second_hits = sorted_hits[1].get("_tag_hits", 0)
-                if max_hits >= second_hits * 3:
+                if max_hits >= second_hits * 2:
                     # Before dropping, protect skills whose name or tags appear
                     # verbatim in the query — user explicitly mentioned them.
                     keep = [sorted_hits[0]]

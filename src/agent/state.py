@@ -113,6 +113,7 @@ class AgentState:
     _task_completed: bool = False           # task_complete() 已调用，阻止 re-entry
     skill_fast_chain_result: bool | None = None  # fast_chain 执行结果（None=未使用）
     completed_subtasks: set[str] = field(default_factory=set)  # 幂等去重
+    skipped_subtasks: set[str] = field(default_factory=set)    # 用户明确跳过的不相关技能
     total_input_tokens: int = 0       # cumulative token tracking
     total_output_tokens: int = 0
     total_cache_read_tokens: int = 0  # cumulative cache read tokens (billed at ¥0.02/M)
@@ -476,6 +477,7 @@ class AgentState:
         self._task_completed = False
         self.skill_fast_chain_result = None
         self.completed_subtasks.clear()
+        self.skipped_subtasks.clear()
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         self.total_cache_read_tokens = 0
